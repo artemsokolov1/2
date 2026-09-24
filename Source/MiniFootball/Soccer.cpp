@@ -594,20 +594,23 @@ void ASoccerPlayer::Setup(int32 InTeam, bool bInGoalkeeper, const FVector& InHom
 	ResetToHome();
 }
 
-void ASoccerPlayer::ApplyCharacterModel(USkeletalMesh* InMesh, UAnimSequence* InIdle, UAnimSequence* InRun)
+void ASoccerPlayer::ApplyCharacterModel(USkeletalMesh* InIdleMesh, UAnimSequence* InIdle,
+                                        USkeletalMesh* InRunMesh, UAnimSequence* InRun)
 {
-	if (!InMesh) return; // модели нет — остаёмся капсулой
+	if (!InIdleMesh) return; // модели нет — остаёмся капсулой
 
-	// Встроенный в ACharacter скелетный меш: ноги на дне капсулы, лицом вперёд (+X)
-	USkeletalMeshComponent* SkelMesh = GetMesh();
-	SkelMesh->SetSkeletalMeshAsset(InMesh);
-	SkelMesh->SetRelativeLocationAndRotation(FVector(0.f, 0.f, -GetCapsuleComponent()->GetUnscaledCapsuleHalfHeight()),
-	                                         FRotator(0.f, MeshYawOffset, 0.f));
-	SkelMesh->SetAnimationMode(EAnimationMode::AnimationSingleNode);
-
+	IdleMesh = InIdleMesh;
+	RunMesh = InRunMesh ? InRunMesh : InIdleMesh;
 	IdleAnim = InIdle;
 	RunAnim = InRun;
 	CurrentAnim = nullptr;
+
+	// Встроенный в ACharacter скелетный меш: ноги на дне капсулы, лицом вперёд (+X)
+	USkeletalMeshComponent* SkelMesh = GetMesh();
+	SkelMesh->SetSkeletalMeshAsset(IdleMesh);
+	SkelMesh->SetRelativeLocationAndRotation(FVector(0.f, 0.f, -GetCapsuleComponent()->GetUnscaledCapsuleHalfHeight()),
+	                                         FRotator(0.f, MeshYawOffset, 0.f));
+	SkelMesh->SetAnimationMode(EAnimationMode::AnimationSingleNode);
 
 	// Капсулу прячем, вместо формы — круг цвета команды под ногами
 	Body->SetVisibility(false);
@@ -619,7 +622,8 @@ void ASoccerPlayer::ApplyCharacterModel(USkeletalMesh* InMesh, UAnimSequence* In
 	UpdateAnimation();
 }
 
-// Анимация по скорости: стоит — Idle, бежит — Running (скорость проигрывания под темп бега)
+// Анимация по скорости: стоит — Idle, бежит — Running (скорость проигрывания под темп бега).
+// Если у анимаций разные скелеты, вместе с анимацией меняется и модель (внешне они одинаковые).
 void ASoccerPlayer::UpdateAnimation()
 {
 	if (!IdleAnim && !RunAnim) return;
@@ -627,15 +631,27 @@ void ASoccerPlayer::UpdateAnimation()
 	const float Speed = GetVelocity().Size2D();
 	// Гистерезис, чтобы анимация не дёргалась на границе: бег с 80 см/с, обратно в Idle ниже 40
 	const bool bRunning = RunAnim && Speed > (CurrentAnim == RunAnim ? 40.f : 80.f);
-	UAnimSequence* Want = bRunning ? RunAnim.Get() : (IdleAnim ? IdleAnim.Get() : RunAnim.Get());
+	UAnimSequence* Want = bRunning ? RunAnim.Get() : IdleAnim.Get();
+	USkeletalMesh* WantMesh = bRunning ? RunMesh.Get() : IdleMesh.Get();
 
 	USkeletalMeshComponent* SkelMesh = GetMesh();
 	if (Want != CurrentAnim)
 	{
-		SkelMesh->PlayAnimation(Want, true);
+		if (WantMesh && SkelMesh->GetSkeletalMeshAsset() != WantMesh)
+		{
+			SkelMesh->SetSkeletalMeshAsset(WantMesh);
+		}
+		if (Want)
+		{
+			SkelMesh->PlayAnimation(Want, true);
+		}
+		else
+		{
+			SkelMesh->Stop();
+		}
 		CurrentAnim = Want;
 	}
-	SkelMesh->SetPlayRate(bRunning ? FMath::Clamp(Speed / RunAnimSpeed, 0.7f, 1.6f) : 1.f);
+	SkelMesh->SetPlayRate(bRunning ? FMath::Clamp(Speed / RunAnimSpeed, 0.8f, 2.f) : 1.f);
 }
 
 void ASoccerPlayer::ResetToHome()
@@ -1897,8 +1913,11 @@ void ASoccerGameMode::LoadProgress()
 	Save->Difficulty = FMath::Clamp(Save->Difficulty, 0, 2);
 }
 
-// 3D-модель футболиста: ищем в папке Content/Characters/Footballer любой Skeletal Mesh
-// и анимации, в названии которых есть «Idle» (стоит) и «Run» (бежит, например Running).
+// 3D-модель футболиста из Content/Characters/Footballer (и подпапок — туда редактор сам
+// импортирует FBX из SourceArt/Footballer, см. MiniFootball.cpp).
+// Анимация Idle — ассет, в пути которого есть «Idle», бег — «Run» (например Running).
+// Если в папке несколько дублей (Mixamo кладёт пустой «Take 001»), берём «mixamo.com».
+// К каждой анимации подбираем модель с тем же скелетом.
 void ASoccerGameMode::LoadCharacterAssets()
 {
 	const FString Folder = TEXT("/Game/Characters/Footballer");
@@ -1909,20 +1928,52 @@ void ASoccerGameMode::LoadCharacterAssets()
 	TArray<FAssetData> Assets;
 	Registry.GetAssetsByPath(FName(*Folder), Assets, true);
 
+	TArray<USkeletalMesh*> Meshes;
+	UAnimSequence* Idle = nullptr;
+	UAnimSequence* Run = nullptr;
+	auto Prefer = [](const UAnimSequence* Current, const FString& CandidatePath)
+	{
+		return !Current || (CandidatePath.Contains(TEXT("mixamo")) && !Current->GetName().Contains(TEXT("mixamo")));
+	};
+
 	for (const FAssetData& Data : Assets)
 	{
-		const FString AssetName = Data.AssetName.ToString();
+		// Путь внутри папки, например "/Running/Running_Anim_mixamo_com"
+		const FString RelPath = Data.PackageName.ToString().RightChop(Folder.Len());
 		UObject* Obj = Data.GetAsset();
 		if (USkeletalMesh* SkelMesh = Cast<USkeletalMesh>(Obj))
 		{
-			if (!FootballerMesh) FootballerMesh = SkelMesh;
+			Meshes.Add(SkelMesh);
 		}
 		else if (UAnimSequence* Anim = Cast<UAnimSequence>(Obj))
 		{
-			if (AssetName.Contains(TEXT("Idle")))     FootballerIdle = Anim;
-			else if (AssetName.Contains(TEXT("Run"))) FootballerRun = Anim;
+			if (RelPath.Contains(TEXT("Idle")))
+			{
+				if (Prefer(Idle, RelPath)) Idle = Anim;
+			}
+			else if (RelPath.Contains(TEXT("Run")))
+			{
+				if (Prefer(Run, RelPath)) Run = Anim;
+			}
 		}
 	}
+
+	auto MeshFor = [&Meshes](const UAnimSequence* Anim) -> USkeletalMesh*
+	{
+		if (!Anim) return nullptr;
+		for (USkeletalMesh* Candidate : Meshes)
+		{
+			if (Candidate->GetSkeleton() == Anim->GetSkeleton()) return Candidate;
+		}
+		return nullptr;
+	};
+
+	USkeletalMesh* IdleMeshAsset = MeshFor(Idle);
+	USkeletalMesh* RunMeshAsset = MeshFor(Run);
+	FootballerIdle = IdleMeshAsset ? Idle : nullptr;   // анимацию без подходящей модели не проиграть
+	FootballerRun = RunMeshAsset ? Run : nullptr;
+	FootballerRunMesh = RunMeshAsset;
+	FootballerMesh = IdleMeshAsset ? IdleMeshAsset : (RunMeshAsset ? RunMeshAsset : (Meshes.Num() > 0 ? Meshes[0] : nullptr));
 
 	// Подсказка в окне игры: что нашлось (видно при запуске из редактора)
 	FString Report;
@@ -1935,10 +1986,9 @@ void ASoccerGameMode::LoadCharacterAssets()
 		Report = FString::Printf(TEXT("Модель: %s | Idle: %s | Бег: %s"), *FootballerMesh->GetName(),
 		                         FootballerIdle ? *FootballerIdle->GetName() : TEXT("нет"),
 		                         FootballerRun ? *FootballerRun->GetName() : TEXT("нет"));
-		const USkeleton* Skel = FootballerMesh->GetSkeleton();
-		if ((FootballerIdle && FootballerIdle->GetSkeleton() != Skel) || (FootballerRun && FootballerRun->GetSkeleton() != Skel))
+		if ((Idle && !FootballerIdle) || (Run && !FootballerRun))
 		{
-			Report += TEXT("\nВНИМАНИЕ: анимации импортированы с другим скелетом — переимпортируйте их, выбрав скелет персонажа");
+			Report += TEXT("\nВНИМАНИЕ: для анимации нет модели с таким же скелетом — при импорте выберите скелет персонажа");
 		}
 	}
 	UE_LOG(LogTemp, Log, TEXT("Soccer: %s"), *Report);
@@ -2189,7 +2239,7 @@ ASoccerPlayer* ASoccerGameMode::SpawnPlayer(int32 InTeam, int32 RosterIdx, const
 		Shorts = FLinearColor(0.9f, 0.9f, 0.9f);
 	}
 	P->Setup(InTeam, bGK, Location, Yaw, PlayerInfo, RosterIdx, Shirt, Shorts);
-	P->ApplyCharacterModel(FootballerMesh, FootballerIdle, FootballerRun); // все футболисты — одна модель
+	P->ApplyCharacterModel(FootballerMesh, FootballerIdle, FootballerRunMesh, FootballerRun); // все футболисты — одна модель
 	Players.Add(P);
 	return P;
 }

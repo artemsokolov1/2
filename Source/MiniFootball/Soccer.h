@@ -268,8 +268,9 @@ public:
 	           const FSoccerPlayerInfo& InInfo, int32 InRosterIndex,
 	           const FLinearColor& Shirt, const FLinearColor& Shorts);
 	void ResetToHome();
-	// 3D-модель футболиста (Mixamo) с анимациями «стоит» и «бежит». Без модели остаёмся капсулой.
-	void ApplyCharacterModel(USkeletalMesh* InMesh, UAnimSequence* InIdle, UAnimSequence* InRun);
+	// 3D-модель футболиста (Mixamo) с анимациями «стоит» и «бежит». У каждой анимации — своя
+	// модель с тем же скелетом (при автоимпорте каждый FBX получает свой скелет). Без модели — капсула.
+	void ApplyCharacterModel(USkeletalMesh* InIdleMesh, UAnimSequence* InIdle, USkeletalMesh* InRunMesh, UAnimSequence* InRun);
 
 	// ---------- Удары и пасы ----------
 	// Расчёт удара без исполнения (для линии прицела) и исполнение.
@@ -342,6 +343,8 @@ private:
 	bool bGKWillSave = false;
 	float GKTackleCooldown = 0.f;
 
+	UPROPERTY() TObjectPtr<USkeletalMesh> IdleMesh;
+	UPROPERTY() TObjectPtr<USkeletalMesh> RunMesh;
 	UPROPERTY() TObjectPtr<UAnimSequence> IdleAnim;
 	UPROPERTY() TObjectPtr<UAnimSequence> RunAnim;
 	UPROPERTY() TObjectPtr<UAnimSequence> CurrentAnim;
@@ -356,7 +359,7 @@ private:
 	static constexpr float SprintSpeed = 680.f;
 	static constexpr float SlowSpeed   = 260.f; // укрывание мяча / жокей
 	static constexpr float KeeperSpeed = 420.f;
-	static constexpr float RunAnimSpeed = 480.f; // скорость (см/с), при которой анимация бега идёт 1:1
+	static constexpr float RunAnimSpeed = 300.f; // скорость (см/с), при которой анимация бега идёт 1:1
 	static constexpr float MeshYawOffset = -90.f; // модели Mixamo после импорта смотрят вдоль +Y
 };
 
@@ -529,7 +532,8 @@ private:
 	UPROPERTY() TObjectPtr<UStaticMesh> CubeMesh;
 	UPROPERTY() TObjectPtr<USoccerSave> Save;
 	// Модель и анимации футболиста из Content/Characters/Footballer (если импортированы)
-	UPROPERTY() TObjectPtr<USkeletalMesh> FootballerMesh;
+	UPROPERTY() TObjectPtr<USkeletalMesh> FootballerMesh;     // модель для Idle (и по умолчанию)
+	UPROPERTY() TObjectPtr<USkeletalMesh> FootballerRunMesh;  // модель со скелетом анимации бега
 	UPROPERTY() TObjectPtr<UAnimSequence> FootballerIdle;
 	UPROPERTY() TObjectPtr<UAnimSequence> FootballerRun;
 

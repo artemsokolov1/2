@@ -15,3 +15,8 @@ Build/
 *.sdf
 *.VC.db
 *.VC.opendb
+
+# 3D-модель футболиста импортируется редактором автоматически из SourceArt/Footballer —
+# импортированные .uasset в репозиторий не кладём (их легко пересоздать, а весят они много)
+Content/Characters/Footballer/*
+!Content/Characters/Footballer/.gitkeep

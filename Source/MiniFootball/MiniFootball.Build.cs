@@ -11,5 +11,11 @@ public class MiniFootball : ModuleRules
 		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput" });
 		// AssetRegistry — поиск 3D-модели футболиста в Content/Characters/Footballer
 		PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore", "AssetRegistry" });
+
+		// Только для редактора: автоимпорт FBX из SourceArt/Footballer (см. MiniFootball.cpp)
+		if (Target.bBuildEditor)
+		{
+			PrivateDependencyModuleNames.AddRange(new string[] { "UnrealEd", "AssetTools" });
+		}
 	}
 }
