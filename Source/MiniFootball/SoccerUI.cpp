@@ -1369,8 +1369,9 @@ TSharedRef<SWidget> SSoccerMenu::BuildSettings()
 				SNew(STextBlock).Font(FontRegular(18)).ColorAndOpacity(ColGray()).AutoWrapText(true)
 				.Text(Ru(TEXT("Управление (геймпад): левый стик — бег · A — пас · B — удар · X — навес · Y — пас в разрез · "
 				              "RT — рывок · LT — укрывание / жокей · RB — финты и изящный удар / прессинг · LB — смена игрока · "
-				              "правый стик — финт · Start — пауза.\n"
-				              "Зажмите кнопку паса или удара — белая линия покажет, куда полетит мяч, а шкала под игроком — силу.\n"
+				              "LB + B — удар «парашютом» · правый стик — финт · Start — пауза.\n"
+				              "Зажмите кнопку паса или удара — белая стрелка покажет направление, а шкала под игроком — силу. "
+				              "Мяч в воздухе рядом — A/B/X/Y играют головой.\n"
 				              "Клавиатура: WASD, Space, F, Q, E, Shift, Ctrl, R, Tab, стрелки, P.")))
 			]
 		];
@@ -1696,17 +1697,18 @@ TSharedRef<SWidget> PlayerCard(const TWeakObjectPtr<ASoccerGameMode>& G, bool bH
 		];
 }
 
-// «ГОЛ!» и итог матча по центру экрана
+// «ГОЛ!» / «ФОЛ!» / «ПЕНАЛЬТИ!» и итог матча по центру экрана
 TSharedRef<SWidget> Banner(const TWeakObjectPtr<ASoccerGameMode>& G)
 {
 	return SNew(SVerticalBox)
 		+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
 		[
-			SNew(STextBlock).Text(Ru(TEXT("ГОЛ!"))).Font(FontBold(120)).ColorAndOpacity(ColLime())
+			SNew(STextBlock).Font(FontBold(100)).ColorAndOpacity(ColLime())
+			.Text_Lambda([G]() { return G.IsValid() ? G->GetEventText() : FText::GetEmpty(); })
 			.ShadowOffset(FVector2D(4.f, 4.f)).ShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.7f))
 			.Visibility_Lambda([G]()
 			{
-				return G.IsValid() && G->GetGoalBannerTime() > 0.f && !G->IsMatchOver()
+				return G.IsValid() && G->GetEventBannerTime() > 0.f && !G->IsMatchOver()
 					? EVisibility::HitTestInvisible : EVisibility::Collapsed;
 			})
 		]

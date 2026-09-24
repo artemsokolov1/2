@@ -3,12 +3,12 @@
 //   Soccer.cpp   — мяч, ворота, игроки и ИИ, управление, режим игры, сохранения
 //   SoccerUI.cpp — интерфейс на Slate: главное меню, HUD матча, пауза
 //
-//  ASoccerBall             — мяч с аркадной физикой (отскоки, трение, удары, дриблинг, прогноз траектории)
+//  ASoccerBall             — мяч: гравитация, сопротивление воздуха, вращение (Магнус), отскоки, штанги, столкновения с игроками
 //  ASoccerGoal             — ворота: штанги, сетка и триггер гола
 //  ASoccerAimLine          — белая линия «куда полетит мяч» при замахе
 //  ASoccerPlayer           — игрок-капсула: управление человеком, ИИ полевого и вратаря
 //  ASoccerPlayerController — геймпад/клавиатура (схема FIFA), переключение игроков, замах с силой
-//  ASoccerHUD              — шкала силы удара под игроком
+//  ASoccerHUD              — шкала силы удара и выносливость под игроком
 //  ASoccerGameMode         — поле, стадион, меню ↔ матч, счёт, таймер, камера, награды
 //  USoccerSave             — прогресс: монеты, состав, форма, испытания, настройки
 
@@ -52,6 +52,7 @@ namespace Soccer
 	constexpr float GoalDepth     = 100.f;  // глубина ворот (до задней сетки)
 	constexpr float BoardGap      = 10.f;   // борт стоит сразу за боковой линией — линии «настоящие»
 	constexpr float BallRadius    = 22.f;   // радиус мяча
+	constexpr float PlayerRadius  = 35.f;   // радиус корпуса игрока (столкновения мяча с игроками)
 	constexpr float PenaltyDepth  = 600.f;  // глубина штрафной площади
 	constexpr int32 HumanTeam     = 0;      // человек играет за команду 0
 	constexpr int32 NumPractice   = 3;      // количество тренировок
@@ -88,12 +89,11 @@ struct FSoccerKit
 const TArray<FSoccerKit>& GetSoccerKits();
 const TArray<FString>& GetClubNames();
 
-// Готовый удар: скорость мяча, закрутка и адресат паса
+// Готовый удар: скорость и вращение мяча, точка прицела и адресат паса
 struct FSoccerKick
 {
 	FVector Velocity = FVector::ZeroVector;
-	FVector Curve = FVector::ZeroVector;
-	float CurveTime = 0.f;
+	FVector Spin = FVector::ZeroVector;   // угловая скорость мяча, рад/с (эффект Магнуса)
 	FVector Target = FVector::ZeroVector; // куда целимся (для стрелки направления)
 	ASoccerPlayer* Receiver = nullptr;
 };
@@ -158,10 +158,12 @@ public:
 	virtual void BeginPlay() override;
 	virtual void Tick(float DeltaTime) override;
 
-	// Удар по мячу: мяч освобождается и получает скорость NewVelocity.
-	// Curve — боковое ускорение (закрутка) на время CurveDuration.
-	void Kick(ASoccerPlayer* Kicker, const FVector& NewVelocity,
-	          const FVector& Curve = FVector::ZeroVector, float CurveDuration = 0.f);
+	// Удар: мяч освобождается и получает скорость и вращение (верхнее/нижнее/боковое).
+	void Kick(ASoccerPlayer* Kicker, const FVector& NewVelocity, const FVector& NewSpin = FVector::ZeroVector);
+	// Касание при ведении: мяч катится по газону с заданной скоростью (владелец не меняется).
+	void Touch(const FVector& NewVelocity);
+	// Придержать мяч у ног (игрок с мячом стоит на месте).
+	void HoldAt(const FVector& Spot, float Dt);
 
 	// Назначить игрока, который ведёт мяч (nullptr — мяч свободен).
 	void SetOwnerPlayer(ASoccerPlayer* NewOwner);
@@ -176,28 +178,34 @@ public:
 	UPROPERTY(VisibleAnywhere) TObjectPtr<USphereComponent> Collision;
 	UPROPERTY(VisibleAnywhere) TObjectPtr<UStaticMeshComponent> Mesh;
 
-	UPROPERTY() TObjectPtr<ASoccerPlayer> OwnerPlayer;      // кто сейчас ведёт мяч
+	UPROPERTY() TObjectPtr<ASoccerPlayer> OwnerPlayer;      // кто ведёт мяч (или держит вратарь)
 	UPROPERTY() TObjectPtr<ASoccerPlayer> LastKicker;       // кто последним бил
 	UPROPERTY() TObjectPtr<ASoccerPlayer> IntendedReceiver; // кому адресован пас
 
 	FVector Velocity = FVector::ZeroVector;
+	FVector Spin = FVector::ZeroVector; // угловая скорость, рад/с
 
-	// Параметры аркадной физики
-	float Gravity        = 1400.f; // гравитация (сильнее реальной — мяч «падает» бодрее)
-	float Bounciness     = 0.55f;  // упругость отскока от газона
-	float WallBounciness = 0.7f;   // упругость отскока от бортов
-	float RollingFriction= 0.8f;   // трение качения (экспоненциальное затухание, 1/с)
-	float AirDrag        = 0.05f;  // сопротивление воздуха
+	// Параметры физики мяча
+	float Gravity         = 1400.f;  // гравитация (сильнее реальной — мяч «падает» бодрее)
+	float Bounciness      = 0.55f;   // упругость отскока от газона
+	float WallBounciness  = 0.7f;    // упругость отскока от бортов
+	float PostBounciness  = 0.6f;    // упругость отскока от штанг и перекладины
+	float RollingFriction = 0.8f;    // трение качения (экспоненциальное затухание, 1/с)
+	float AirDragQuad     = 6e-5f;   // сопротивление воздуха: a = −k·|v|·v (быстрый мяч тормозит сильнее)
+	float MagnusCoeff     = 0.02f;   // эффект Магнуса: a = k·(ω × v)
+	float SpinDecayAir    = 0.4f;    // затухание вращения в полёте, 1/с
+
+	static constexpr float PostRadius = 6.f; // радиус штанг и перекладины
 
 private:
-	// Один шаг физики: гравитация, трение, отскоки, борта, ворота.
-	void Integrate(FVector& P, FVector& V, const FVector& Curve, float& CurveTime, float Dt) const;
-	// Борта вокруг поля и «коробка» ворот: внутрь только через створ, изнутри держит сетка.
+	// Один шаг физики: гравитация, сопротивление, Магнус, трение, отскоки, борта, ворота.
+	void Integrate(FVector& P, FVector& V, FVector& W, float Dt) const;
+	// Борта вокруг поля и ворота: внутрь только через створ, круглые штанги и перекладина, сетка.
 	void CollideWithWalls(FVector& P, const FVector& OldP, FVector& V) const;
+	// Мяч отскакивает от корпуса и ног игроков (кроме того, кто ведёт мяч).
+	void CollideWithPlayers(FVector& P);
 
-	FVector CurveAccel = FVector::ZeroVector;
-	float CurveTimeLeft = 0.f;
-	float LastKickTime  = -100.f;
+	float LastKickTime = -100.f;
 };
 
 // ============================================================================
@@ -271,23 +279,28 @@ public:
 	void ApplyCharacterModel(USkeletalMesh* InIdleMesh, UAnimSequence* InIdle, USkeletalMesh* InRunMesh, UAnimSequence* InRun);
 
 	// ---------- Удары и пасы ----------
-	// Расчёт удара без исполнения (для линии прицела) и исполнение.
-	FSoccerKick PlanPass(EPassKind Kind, const FVector& AimDir, float Power01) const;
-	FSoccerKick PlanShot(const FVector& AimDir, float Power01, bool bFinesse, bool bWithError) const;
+	// Расчёт удара без исполнения (для стрелки направления) и исполнение.
+	// bWithError — добавить разброс по точности (навык, сила, угол тела, прессинг, удар в касание).
+	FSoccerKick PlanPass(EPassKind Kind, const FVector& AimDir, float Power01, bool bWithError) const;
+	FSoccerKick PlanShot(const FVector& AimDir, float Power01, bool bFinesse, bool bChip, bool bWithError) const;
+	// Если мяч укатился дальше, чем достаёт нога, удар откладывается: игрок добегает и бьёт.
 	void Pass(EPassKind Kind, const FVector& AimDir, float Power01 = 0.5f);
-	void Shoot(const FVector& AimDir, float Power01, bool bFinesse);
+	void Shoot(const FVector& AimDir, float Power01, bool bFinesse, bool bChip = false);
+	void Header(bool bShot, const FVector& AimDir); // прыжок и удар головой по мячу в воздухе
 
 	// ---------- Оборона и прочее ----------
-	void Tackle();                          // обычный отбор / толчок
+	void Tackle();                          // отбор ногой: попал в мяч — выбил, попал в ноги — фол
 	void SlideTackle(const FVector& Dir);   // подкат
-	void SkillMove(const FVector& Dir, bool bBig); // финт правым стиком
+	void SkillMove(const FVector& Dir, bool bBig); // финт правым стиком: откидка мяча в сторону
 	void Stun(float Seconds);               // игрок «сбит»: теряет мяч и управление
 	void GainBall();                        // забрать мяч себе
 
 	// ---------- Состояние ----------
 	bool HasBall() const;
 	bool TeamHasBall() const;
-	bool CanKickBall() const;   // мяч у ног или рядом (в т.ч. в воздухе — удар головой/с лёта)
+	bool CanKickBall() const;   // мяч в зоне удара ногой (у ног или рядом, в т.ч. с лёта)
+	bool CanHeadBall() const;   // мяч в воздухе рядом — можно сыграть головой
+	float GetStamina() const { return Stamina; }
 	bool IsShielding() const { return bShielding; }
 	float AttackSign() const { return Team == 0 ? 1.f : -1.f; }
 
@@ -321,7 +334,14 @@ private:
 	void KeeperCatch();        // вратарь: поймать мяч в руки
 	void UpdateBodyPose(float Dt); // наклон модели в подкате и в броске вратаря
 	bool TickDash(float Dt);   // рывок/подкат/финт: движение по заданному направлению
-	void TryControlBall();     // подобрать свободный мяч
+	void TryControlBall();     // приём мяча (первое касание) и перехват между касаниями соперника
+	void TickDribble(float Dt);        // ведение касаниями: мяч толкается вперёд, между касаниями свободен
+	bool TickPendingKick(float Dt);    // добежать до мяча и выполнить отложенный удар
+	void UpdateLocomotion(float Dt);   // инерция: разгон, торможение, радиус поворота, выносливость
+	float SprintSpeedNow() const;      // скорость спринта с учётом усталости
+	float KickErrorDegrees(int32 Skill, float Power01, const FVector& Dir, bool bFirstTime) const;
+	void QueueKick(ECharge Kind, const FVector& AimDir, float Power01, bool bFinesse, bool bChip);
+	void ExecuteQueued();
 	bool ShouldChase() const;  // бежать ли ИИ к мячу
 	FVector FormationPoint() const;
 	void MoveTo(const FVector& Target, float Speed);
@@ -335,6 +355,22 @@ private:
 	ASoccerPlayerController* HumanPC() const;
 
 	bool bShielding = false;
+	bool bSprinting = false;      // в этом кадре бежит спринтом (тратит выносливость)
+	bool bCloseControl = false;   // LT с мячом — короткие касания
+	float Stamina = 1.f;          // выносливость 0..1: спринт тратит, шаг восстанавливает
+	float TouchCooldown = 0.f;
+	float ControlCooldown = 0.f;
+	bool bSlideResolved = false;  // подкат уже выбил мяч или сфолил
+
+	// Отложенный удар (мяч впереди, игрок добегает до него)
+	bool bPendingKick = false;
+	ECharge PendingKind = ECharge::None;
+	FVector PendingAim = FVector::ZeroVector;
+	float PendingPower = 0.f;
+	bool bPendingFinesse = false;
+	bool bPendingChip = false;
+	float PendingTime = 0.f;
+
 	float StunTime = 0.f;
 	float TackleCooldown = 0.f;
 	float SkillCooldown = 0.f;
@@ -373,6 +409,7 @@ private:
 	static constexpr float KeeperSpeed = 420.f;
 	static constexpr float RunAnimSpeed = 300.f; // скорость (см/с), при которой анимация бега идёт 1:1
 	static constexpr float MeshYawOffset = -90.f; // модели Mixamo после импорта смотрят вдоль +Y
+	static constexpr float KickReach = 95.f;      // до какого расстояния достаёт нога
 };
 
 // ============================================================================
@@ -407,6 +444,7 @@ public:
 	float SprintAxis = 0.f;   // RT
 	float LTAxis     = 0.f;   // LT: укрывание мяча / жокей
 	bool bRBHeld       = false; // RB: модификатор финтов / прессинг партнёром
+	bool bLBHeld       = false; // LB в атаке: LB + B — удар «парашютом»
 	bool bContainHeld  = false; // A в обороне: сдерживание
 	bool bGKRushHeld   = false; // удержание Y в обороне: выход вратаря
 
@@ -440,6 +478,7 @@ private:
 	void OnY();
 	void OnYStop();
 	void OnLB();
+	void OnLBStop();
 	void OnStart();
 
 	UPROPERTY() TObjectPtr<UInputMappingContext> Context;
@@ -495,6 +534,7 @@ public:
 	// ---------- События матча ----------
 	void OnGoalScored(int32 ScoringTeam);
 	void OnHumanPass();
+	void OnFoul(ASoccerPlayer* Offender, ASoccerPlayer* Victim); // фол: штрафной или пенальти
 
 	// ---------- Данные для HUD и ИИ ----------
 	bool IsPlayActive() const { return bPlayActive; }
@@ -503,7 +543,8 @@ public:
 	bool IsPractice() const { return MatchMode != ESoccerMode::Match; }
 	int32 GetScore(int32 InTeam) const { return Score[InTeam]; }
 	float GetTimeLeft() const { return TimeLeft; }
-	float GetGoalBannerTime() const { return GoalBanner; }
+	float GetEventBannerTime() const { return EventBanner; }
+	const FText& GetEventText() const { return EventText; }
 	const FText& GetResultText() const { return ResultText; }
 	FString GetTeamName(int32 InTeam) const;
 	int32 GetPracticeTarget() const;
@@ -534,6 +575,7 @@ private:
 	void DestroyPlayers();
 	void PossessHuman();
 	void ResetPositions();
+	void StartSetPiece();
 	void EndMatch();
 	void UpdateCamera(float Dt);
 	void ShowWidget(TSharedPtr<SWidget>& Holder, const TSharedRef<SWidget>& Widget, int32 ZOrder);
@@ -559,7 +601,12 @@ private:
 	int32 MatchDifficulty = 1;
 	int32 Score[2] = { 0, 0 };
 	float TimeLeft = 60.f;
-	float GoalBanner = 0.f;
+	float EventBanner = 0.f;     // сколько ещё показывать «ГОЛ!» / «ФОЛ!» / «ПЕНАЛЬТИ!»
+	FText EventText;
+	// Стандарт после фола
+	TWeakObjectPtr<ASoccerPlayer> SetPieceTaker;
+	FVector SetPieceSpot = FVector::ZeroVector;
+	bool bPenalty = false;
 	float MenuTime = 0.f;
 	bool bInMatch = false;
 	bool bPlayActive = false;

@@ -191,7 +191,7 @@ ASoccerBall::ASoccerBall()
 	PrimaryActorTick.bCanEverTick = true;
 
 	// Сфера-коллизия нужна только для оверлапа с триггерами ворот.
-	// Движение считаем сами (аркадная физика), физику движка не включаем.
+	// Движение считаем сами, физику движка не включаем.
 	Collision = CreateDefaultSubobject<USphereComponent>(TEXT("Collision"));
 	Collision->InitSphereRadius(BallRadius);
 	Collision->SetCollisionProfileName(TEXT("OverlapAllDynamic"));
@@ -210,15 +210,30 @@ void ASoccerBall::BeginPlay()
 	Paint(Mesh, FLinearColor::White);
 }
 
-void ASoccerBall::Kick(ASoccerPlayer* Kicker, const FVector& NewVelocity, const FVector& Curve, float CurveDuration)
+void ASoccerBall::Kick(ASoccerPlayer* Kicker, const FVector& NewVelocity, const FVector& NewSpin)
 {
 	OwnerPlayer = nullptr;
 	IntendedReceiver = nullptr;
 	LastKicker = Kicker;
 	LastKickTime = GetWorld()->GetTimeSeconds();
 	Velocity = NewVelocity;
-	CurveAccel = Curve;
-	CurveTimeLeft = CurveDuration;
+	Spin = NewSpin;
+}
+
+void ASoccerBall::Touch(const FVector& NewVelocity)
+{
+	// Касание при ведении: мяч катится по газону (вращение — как у катящегося мяча)
+	Velocity = FVector(NewVelocity.X, NewVelocity.Y, 0.f);
+	Spin = FVector::CrossProduct(FVector::UpVector, Velocity) / BallRadius;
+}
+
+void ASoccerBall::HoldAt(const FVector& Spot, float Dt)
+{
+	// Мягко подтягиваем мяч к точке у ног (игрок с мячом стоит)
+	FVector ToSpot = Spot - GetActorLocation();
+	ToSpot.Z = 0.f;
+	Velocity = (ToSpot * 6.f).GetClampedToMaxSize(300.f);
+	Spin = FVector::CrossProduct(FVector::UpVector, Velocity) / BallRadius;
 }
 
 void ASoccerBall::SetOwnerPlayer(ASoccerPlayer* NewOwner)
@@ -227,8 +242,8 @@ void ASoccerBall::SetOwnerPlayer(ASoccerPlayer* NewOwner)
 	if (NewOwner)
 	{
 		IntendedReceiver = nullptr;
-		CurveTimeLeft = 0.f;
 		Velocity = FVector::ZeroVector;
+		Spin = FVector::ZeroVector;
 	}
 	// при потере владельца мяч сохраняет текущую скорость и катится дальше
 }
@@ -237,10 +252,10 @@ void ASoccerBall::ResetBall(const FVector& Location)
 {
 	SetActorLocation(Location);
 	Velocity = FVector::ZeroVector;
+	Spin = FVector::ZeroVector;
 	OwnerPlayer = nullptr;
 	LastKicker = nullptr;
 	IntendedReceiver = nullptr;
-	CurveTimeLeft = 0.f;
 }
 
 float ASoccerBall::TimeSinceKick() const
@@ -252,26 +267,22 @@ void ASoccerBall::Tick(float Dt)
 {
 	Super::Tick(Dt);
 
-	const FVector OldP = GetActorLocation();
-	FVector P = OldP;
+	FVector P = GetActorLocation();
 
-	if (OwnerPlayer)
+	if (OwnerPlayer && OwnerPlayer->bGoalkeeper)
 	{
-		// ДРИБЛИНГ: мяч «прилипает» к ногам владельца, чуть впереди.
-		// При укрывании мяча корпусом он держится ближе к игроку.
-		// Вратарь держит мяч в руках на уровне груди.
-		const bool bInHands = OwnerPlayer->bGoalkeeper;
-		const float Dist = bInHands ? 40.f : (OwnerPlayer->IsShielding() ? 40.f : 62.f);
-		FVector Target = OwnerPlayer->GetActorLocation() + OwnerPlayer->GetActorForwardVector() * Dist;
-		Target.Z = bInHands ? 110.f : BallRadius;
+		// Вратарь держит мяч в руках на уровне груди
+		FVector Target = OwnerPlayer->GetActorLocation() + OwnerPlayer->GetActorForwardVector() * 40.f;
+		Target.Z = 110.f;
 		P = FMath::VInterpTo(P, Target, Dt, 25.f);
-		Velocity = OwnerPlayer->GetVelocity();
-		Velocity.Z = 0.f;
-		CollideWithWalls(P, OldP, Velocity);
+		Velocity = FVector::ZeroVector;
+		Spin = FVector::ZeroVector;
 	}
 	else
 	{
-		Integrate(P, Velocity, CurveAccel, CurveTimeLeft, Dt);
+		// Мяч всегда живёт по физике — и свободный, и при ведении (игрок только подталкивает его касаниями)
+		Integrate(P, Velocity, Spin, Dt);
+		CollideWithPlayers(P);
 		if (IntendedReceiver && TimeSinceKick() > 2.5f)
 		{
 			IntendedReceiver = nullptr; // пас «протух»
@@ -282,44 +293,49 @@ void ASoccerBall::Tick(float Dt)
 	SetActorLocation(P);
 }
 
-void ASoccerBall::Integrate(FVector& P, FVector& V, const FVector& Curve, float& CurveTime, float Dt) const
+void ASoccerBall::Integrate(FVector& P, FVector& V, FVector& W, float Dt) const
 {
 	const FVector OldP = P;
-
-	// Закрутка (изящный удар): боковое ускорение в первые доли секунды полёта
-	if (CurveTime > 0.f)
-	{
-		V += Curve * Dt;
-		CurveTime -= Dt;
-	}
-
 	const bool bGrounded = P.Z <= BallRadius + 1.f && FMath::Abs(V.Z) < 1.f;
+
 	if (!bGrounded)
 	{
+		// Полёт: гравитация, квадратичное сопротивление воздуха и эффект Магнуса:
+		// верхнее вращение прижимает мяч вниз («ныряет»), нижнее — поддерживает, боковое — закручивает
 		V.Z -= Gravity * Dt;
+		V -= V * (AirDragQuad * V.Size() * Dt);
+		V += FVector::CrossProduct(W, V) * (MagnusCoeff * Dt);
+		W *= FMath::Exp(-SpinDecayAir * Dt);
 	}
-
-	// Трение: на газоне — качение, в воздухе — слабое сопротивление.
-	// Экспоненциальное затухание: v(t) = v0 * e^(-k t) -> путь до остановки = v0 / k.
-	const float Damp = FMath::Exp(-(bGrounded ? RollingFriction : AirDrag) * Dt);
-	V.X *= Damp;
-	V.Y *= Damp;
-	if (bGrounded && V.Size2D() < 15.f)
+	else
 	{
-		V = FVector::ZeroVector; // мяч остановился
+		// Качение по газону: трение, вращение без проскальзывания
+		const float Damp = FMath::Exp(-RollingFriction * Dt);
+		V.X *= Damp;
+		V.Y *= Damp;
+		if (V.Size2D() < 15.f)
+		{
+			V = FVector::ZeroVector; // мяч остановился
+		}
+		W = FVector::CrossProduct(FVector::UpVector, V) / BallRadius;
 	}
 
 	P += V * Dt;
 
-	// Отскок от газона
+	// Отскок от газона. Вращение переходит в скорость: после удара с верхним вращением мяч
+	// «прыгает» вперёд, с нижним — тормозит и «закапывается».
 	if (P.Z < BallRadius)
 	{
 		P.Z = BallRadius;
 		if (V.Z < -150.f)
 		{
 			V.Z = -V.Z * Bounciness;
-			V.X *= 0.9f;
-			V.Y *= 0.9f;
+			FVector SpinVel = FVector::CrossProduct(W, FVector::UpVector) * BallRadius;
+			SpinVel.Z = 0.f;
+			const FVector Horizontal = FMath::Lerp(FVector(V.X, V.Y, 0.f), SpinVel, 0.35f) * 0.92f;
+			V.X = Horizontal.X;
+			V.Y = Horizontal.Y;
+			W = FMath::Lerp(W, FVector::CrossProduct(FVector::UpVector, Horizontal) / BallRadius, 0.5f);
 		}
 		else
 		{
@@ -342,17 +358,43 @@ void ASoccerBall::CollideWithWalls(FVector& P, const FVector& OldP, FVector& V) 
 		V.Y = -FMath::Sign(P.Y) * FMath::Abs(V.Y) * WallBounciness;
 	}
 
-	// Лицевые линии: за линию ворот мяч уходит только в створ,
-	// в штангу/перекладину и мимо ворот — отскок от линии
+	// Лицевые линии: за линию ворот мяч уходит только в створ (центр мяча внутри рамки),
+	// мимо ворот и над перекладиной — отскок от борта
 	const bool bWasInGoal = FMath::Abs(OldP.X) > HalfLength;
 	if (!bWasInGoal && FMath::Abs(P.X) > HalfLength - R)
 	{
-		const bool bInMouth = FMath::Abs(P.Y) < GoalHalfWidth - R && P.Z < GoalHeight - R;
+		const bool bInMouth = FMath::Abs(P.Y) < GoalHalfWidth && P.Z < GoalHeight;
 		if (!bInMouth)
 		{
 			P.X = FMath::Sign(P.X) * (HalfLength - R);
 			V.X = -FMath::Sign(P.X) * FMath::Abs(V.X) * WallBounciness;
 		}
+	}
+
+	// Штанги и перекладина — круглые: отскок по нормали к поверхности (удар в штангу, «в крестовину»)
+	auto HitBar = [&P, &V, R, this](const FVector& A, const FVector& B)
+	{
+		const FVector AB = B - A;
+		const float T = FMath::Clamp<float>(FVector::DotProduct(P - A, AB) / AB.SizeSquared(), 0.f, 1.f);
+		const FVector Q = A + AB * T;
+		const FVector D = P - Q;
+		const float Dist = D.Size();
+		const float MinDist = R + PostRadius;
+		if (Dist >= MinDist || Dist < 0.01f) return;
+		const FVector N = D / Dist;
+		P = Q + N * MinDist;
+		const float Vn = FVector::DotProduct(V, N);
+		if (Vn < 0.f)
+		{
+			V -= N * (Vn * (1.f + PostBounciness));
+		}
+	};
+	for (int32 S = -1; S <= 1; S += 2)
+	{
+		const float X = S * HalfLength;
+		HitBar(FVector(X, -GoalHalfWidth, 0.f), FVector(X, -GoalHalfWidth, GoalHeight));
+		HitBar(FVector(X,  GoalHalfWidth, 0.f), FVector(X,  GoalHalfWidth, GoalHeight));
+		HitBar(FVector(X, -GoalHalfWidth, GoalHeight), FVector(X, GoalHalfWidth, GoalHeight));
 	}
 
 	if (FMath::Abs(P.X) > HalfLength)
@@ -373,6 +415,43 @@ void ASoccerBall::CollideWithWalls(FVector& P, const FVector& OldP, FVector& V) 
 		{
 			P.Z = GoalHeight - R;
 			V.Z = FMath::Min<double>(V.Z, 0.0);
+		}
+	}
+}
+
+void ASoccerBall::CollideWithPlayers(FVector& P)
+{
+	const ASoccerGameMode* G = GetWorld()->GetAuthGameMode<ASoccerGameMode>();
+	if (!G) return;
+
+	for (ASoccerPlayer* Pl : G->Players)
+	{
+		if (!Pl || Pl == OwnerPlayer) continue;                                   // свой мяч не мешает
+		if (Pl == LastKicker && TimeSinceKick() < 0.2f) continue;                 // только что ударил сам
+		const FVector C = Pl->GetActorLocation();
+		if (P.Z > C.Z + 90.f + BallRadius) continue;                              // мяч над головой
+
+		FVector D = P - C;
+		D.Z = 0.f;
+		const float Dist = D.Size();
+		const float MinDist = PlayerRadius + BallRadius;
+		if (Dist >= MinDist || Dist < 0.01f) continue;
+
+		// Мяч попал в корпус или ноги: выталкиваем и отражаем с потерей скорости (блок удара, рикошет)
+		const FVector N = D / Dist;
+		P.X = C.X + N.X * MinDist;
+		P.Y = C.Y + N.Y * MinDist;
+		const float Vn = FVector::DotProduct(Velocity, N);
+		if (Vn < 0.f)
+		{
+			Velocity -= N * (Vn * 1.4f);
+			Velocity *= 0.7f;
+			Spin *= 0.5f;
+		}
+		// Мяч, который вёл другой игрок, отскочил от соперника — владение потеряно
+		if (OwnerPlayer)
+		{
+			SetOwnerPlayer(nullptr);
 		}
 	}
 }
@@ -443,7 +522,7 @@ void ASoccerGoal::OnTriggerOverlap(UPrimitiveComponent* OverlappedComp, AActor* 
 }
 
 // ============================================================================
-//  ЛИНИЯ ПРИЦЕЛА — цепочка тонких белых отрезков вдоль прогноза полёта мяча
+//  ЛИНИЯ ПРИЦЕЛА — белая стрелка направления паса/удара
 // ============================================================================
 
 ASoccerAimLine::ASoccerAimLine()
@@ -638,9 +717,14 @@ void ASoccerPlayer::ResetToHome()
 	SetActorRotation(FRotator(0.f, HomeYaw, 0.f));
 	GetCharacterMovement()->StopMovementImmediately();
 	StunTime = TackleCooldown = SkillCooldown = ProtectTime = DashTime = 0.f;
+	TouchCooldown = ControlCooldown = GKHoldTime = SlidePoseTime = DivePoseTime = 0.f;
 	AIDecisionTimer = 0.5f;
 	bSliding = false;
 	bShielding = false;
+	bPendingKick = false;
+	bSlideResolved = true;
+	bGKDived = false;
+	Stamina = FMath::Min(1.f, Stamina + 0.15f); // пауза после гола — немного отдышаться
 }
 
 ASoccerGameMode* ASoccerPlayer::GM() const
@@ -659,6 +743,12 @@ float ASoccerPlayer::SpeedFactor() const
 	return FMath::Clamp(0.85f + (Info.Pace - 50) * 0.006f, 0.8f, 1.15f);
 }
 
+// Спринт с учётом усталости: при выносливости ниже 30% спринт постепенно превращается в обычный бег
+float ASoccerPlayer::SprintSpeedNow() const
+{
+	return FMath::Lerp(RunSpeed, SprintSpeed, FMath::Clamp(Stamina / 0.3f, 0.f, 1.f));
+}
+
 bool ASoccerPlayer::HasBall() const
 {
 	const ASoccerGameMode* G = GM();
@@ -673,12 +763,22 @@ bool ASoccerPlayer::TeamHasBall() const
 
 bool ASoccerPlayer::CanKickBall() const
 {
-	if (HasBall()) return true;
+	const ASoccerGameMode* G = GM();
+	if (!G || !G->Ball) return false;
+	if (bGoalkeeper && HasBall()) return true; // мяч в руках вратаря
+	const ASoccerBall* Ball = G->Ball;
+	if (Ball->OwnerPlayer && Ball->OwnerPlayer.Get() != this) return false; // мяч у другого — нужен отбор
+	// Нога достаёт мяч у газона и до пояса (удар с лёта); выше — только головой
+	const FVector B = Ball->GetActorLocation();
+	return FVector::Dist2D(B, GetActorLocation()) < KickReach && B.Z < 110.f;
+}
+
+bool ASoccerPlayer::CanHeadBall() const
+{
 	const ASoccerGameMode* G = GM();
 	if (!G || !G->Ball || G->Ball->OwnerPlayer) return false;
-	// Свободный мяч рядом: удар в касание, с лёта или головой (до ~2.4 м высоты)
 	const FVector B = G->Ball->GetActorLocation();
-	return FVector::Dist2D(B, GetActorLocation()) < 110.f && B.Z < 240.f;
+	return FVector::Dist2D(B, GetActorLocation()) < 130.f && B.Z >= 110.f && B.Z < 280.f;
 }
 
 void ASoccerPlayer::GainBall()
@@ -687,6 +787,8 @@ void ASoccerPlayer::GainBall()
 	if (!G || !G->Ball) return;
 	G->Ball->SetOwnerPlayer(this);
 	AIDecisionTimer = 0.4f; // ИИ «осматривается» перед решением
+	TouchCooldown = 0.f;
+	bPendingKick = false;
 
 	// Как в FIFA: если мяч получил партнёр человека — управление переходит к нему
 	if (Team == HumanTeam && !IsPlayerControlled() && !bGoalkeeper)
@@ -703,6 +805,7 @@ void ASoccerPlayer::Stun(float Seconds)
 	StunTime = FMath::Max(StunTime, Seconds);
 	DashTime = 0.f;
 	bSliding = false;
+	bPendingKick = false;
 	if (HasBall())
 	{
 		GM()->Ball->SetOwnerPlayer(nullptr); // мяч отскакивает и катится дальше
@@ -725,16 +828,20 @@ void ASoccerPlayer::Tick(float Dt)
 	UpdateAnimation();
 	UpdateBodyPose(Dt);
 
-	StunTime       = FMath::Max(0.f, StunTime - Dt);
-	TackleCooldown = FMath::Max(0.f, TackleCooldown - Dt);
-	SkillCooldown  = FMath::Max(0.f, SkillCooldown - Dt);
-	ProtectTime    = FMath::Max(0.f, ProtectTime - Dt);
+	StunTime         = FMath::Max(0.f, StunTime - Dt);
+	TackleCooldown   = FMath::Max(0.f, TackleCooldown - Dt);
+	SkillCooldown    = FMath::Max(0.f, SkillCooldown - Dt);
+	ProtectTime      = FMath::Max(0.f, ProtectTime - Dt);
 	GKTackleCooldown = FMath::Max(0.f, GKTackleCooldown - Dt);
+	TouchCooldown    = FMath::Max(0.f, TouchCooldown - Dt);
+	ControlCooldown  = FMath::Max(0.f, ControlCooldown - Dt);
 	AIDecisionTimer -= Dt;
+	bSprinting = false; // выставят TickHuman / ИИ
 
 	// В меню, после гола и после финального свистка все стоят
 	if (!G->IsPlayActive() || StunTime > 0.f)
 	{
+		UpdateLocomotion(Dt);
 		return;
 	}
 
@@ -748,18 +855,288 @@ void ASoccerPlayer::Tick(float Dt)
 	if (bGoalkeeper)
 	{
 		TickGoalkeeper(Dt);
+		UpdateLocomotion(Dt);
 		return;
 	}
 
 	TryControlBall();
-
-	if (IsPlayerControlled())
+	if (HasBall())
 	{
-		TickHuman(Dt);
+		TickDribble(Dt);
+	}
+
+	if (!TickPendingKick(Dt))
+	{
+		if (IsPlayerControlled())
+		{
+			TickHuman(Dt);
+		}
+		else
+		{
+			TickFieldAI(Dt);
+		}
+	}
+	UpdateLocomotion(Dt);
+}
+
+// Инерция: разгон зависит от СКР, низкое трение не даёт мгновенно развернуть скорость,
+// на бегу корпус поворачивается медленнее (поворот дугой). Спринт тратит выносливость.
+void ASoccerPlayer::UpdateLocomotion(float Dt)
+{
+	UCharacterMovementComponent* Move = GetCharacterMovement();
+	const float Speed = GetVelocity().Size2D();
+
+	if (bSprinting && Speed > RunSpeed * 0.8f)
+	{
+		Stamina -= Dt * FMath::Lerp(0.16f, 0.08f, Info.Physical / 100.f); // ФИЗ — устаёт медленнее
 	}
 	else
 	{
-		TickFieldAI(Dt);
+		Stamina += Dt * 0.07f;
+	}
+	Stamina = FMath::Clamp(Stamina, 0.f, 1.f);
+
+	const float PaceAlpha = FMath::Clamp((Info.Pace - 40) / 59.f, 0.f, 1.f);
+	const float Accel = bGoalkeeper ? 2600.f : FMath::Lerp(1100.f, 1900.f, PaceAlpha);
+	Move->MaxAcceleration = Accel * (HasBall() ? 0.85f : 1.f); // с мячом разгоняемся медленнее
+	Move->BrakingDecelerationWalking = bGoalkeeper ? 2500.f : 1500.f;
+	Move->GroundFriction = bGoalkeeper ? 8.f : 3.5f;
+	const float SpeedRatio = FMath::Clamp(Speed / 700.f, 0.f, 1.f);
+	Move->RotationRate = FRotator(0.f, FMath::Lerp(720.f, 300.f, SpeedRatio), 0.f);
+}
+
+bool ASoccerPlayer::TickDash(float Dt)
+{
+	if (DashTime <= 0.f) return false;
+
+	DashTime -= Dt;
+	UCharacterMovementComponent* Move = GetCharacterMovement();
+	Move->bOrientRotationToMovement = !bGoalkeeper; // вратарь прыгает боком
+	Move->MaxWalkSpeed = DashSpeed;
+	Move->MaxAcceleration = 5000.f;
+	Move->GroundFriction = 8.f;
+	AddMovementInput(DashDir, 1.f);
+
+	if (bSliding && !bSlideResolved)
+	{
+		ASoccerGameMode* G = GM();
+		ASoccerBall* Ball = G->Ball;
+		const FVector Foot = GetActorLocation() + DashDir * 70.f; // в подкате ноги впереди
+		const FVector B = Ball->GetActorLocation();
+		ASoccerPlayer* Carrier = Ball->OwnerPlayer;
+		const bool bCanPlayBall = Carrier != this && (!Carrier || (Carrier->Team != Team && !Carrier->bGoalkeeper));
+
+		if (bCanPlayBall && FVector::Dist2D(B, Foot) < 85.f && B.Z < 60.f)
+		{
+			// Чистый подкат: ноги первыми достали мяч — мяч выбит, соперник падает
+			bSlideResolved = true;
+			if (Carrier) Carrier->Stun(0.8f);
+			const FVector Side = FVector::CrossProduct(FVector::UpVector, DashDir) * FMath::FRandRange(-0.4f, 0.4f);
+			Ball->Kick(this, (DashDir + Side).GetSafeNormal() * 750.f);
+		}
+		else
+		{
+			// Ноги соперника оказались раньше мяча — фол
+			for (ASoccerPlayer* Other : G->Players)
+			{
+				if (!Other || Other->Team == Team || Other->StunTime > 0.f) continue;
+				if (FVector::Dist2D(Other->GetActorLocation(), Foot) < 60.f)
+				{
+					bSlideResolved = true;
+					G->OnFoul(this, Other);
+					break;
+				}
+			}
+		}
+	}
+
+	if (DashTime <= 0.f && bSliding)
+	{
+		bSliding = false;
+		StunTime = 0.45f; // время подняться после подката
+	}
+	return true;
+}
+
+// ПРИЁМ МЯЧА (первое касание) и перехват мяча между касаниями соперника
+void ASoccerPlayer::TryControlBall()
+{
+	ASoccerBall* Ball = GM()->Ball;
+	if (ControlCooldown > 0.f || HasBall()) return;
+	if (Ball->LastKicker == this && Ball->TimeSinceKick() < 0.3f) return; // только что ударили сами
+
+	const FVector B = Ball->GetActorLocation();
+	FVector ToBall = B - GetActorLocation();
+	ToBall.Z = 0.f;
+	const float Dist = ToBall.Size();
+
+	if (ASoccerPlayer* Owner = Ball->OwnerPlayer)
+	{
+		// Мяч ведёт соперник. Между касаниями мяч отходит от его ног — его можно выковырнуть
+		if (Owner->Team == Team || Owner->bGoalkeeper) return;
+		if (Dist > 60.f || FVector::Dist2D(B, Owner->GetActorLocation()) < 75.f) return;
+		ControlCooldown = 0.5f;
+		const float Chance = FMath::Clamp(0.45f + (Info.Defending - Owner->Info.Dribbling) / 150.f, 0.15f, 0.8f);
+		if (FMath::FRand() < Chance)
+		{
+			Ball->SetOwnerPlayer(nullptr);
+			GainBall();
+			Ball->Touch(GetActorForwardVector() * 250.f);
+		}
+		return;
+	}
+
+	if (Dist > 70.f || B.Z > 150.f) return; // выше полутора метров — только головой
+
+	// Качество приёма: навык (ДРБ и ПАС) против сложности мяча — скорость, высота,
+	// положение корпуса (спиной к мячу принимать сложнее) и приём на спринте
+	const float Speed = Ball->Velocity.Size();
+	const float Skill = (Info.Dribbling * 0.6f + Info.Passing * 0.4f) / 100.f;
+	float Difficulty = Speed / 2200.f;
+	if (B.Z > 60.f) Difficulty += 0.25f; // грудью или бедром
+	const float Facing = FVector::DotProduct(GetActorForwardVector(), ToBall.GetSafeNormal());
+	Difficulty += (1.f - Facing) * 0.15f;
+	if (GetVelocity().Size2D() > RunSpeed * 1.1f) Difficulty += 0.15f;
+	const float Quality = Skill - Difficulty * 0.6f + FMath::FRandRange(-0.15f, 0.15f);
+
+	// Куда обработать мяч: человек — по стику (направленный приём), иначе — по ходу или по взгляду
+	FVector TouchDir = GetActorForwardVector();
+	if (const ASoccerPlayerController* PC = Cast<ASoccerPlayerController>(GetController()))
+	{
+		const FVector Stick = PC->StickToWorld(PC->MoveInput);
+		if (Stick.Size() > 0.3f) TouchDir = Stick.GetSafeNormal2D();
+	}
+	else if (GetVelocity().Size2D() > 100.f)
+	{
+		TouchDir = GetVelocity().GetSafeNormal2D();
+	}
+
+	if (Quality > 0.35f)
+	{
+		// Чистый приём: мяч под контролем, мягко уводим его по ходу
+		GainBall();
+		Ball->Touch(TouchDir * (150.f + GetVelocity().Size2D() * 0.9f));
+	}
+	else if (Quality > 0.1f)
+	{
+		// Тяжёлое касание: мяч наш, но отскочил дальше и в сторону — надо догонять
+		GainBall();
+		const FVector Dir = TouchDir.RotateAngleAxis(FMath::FRandRange(-35.f, 35.f), FVector::UpVector);
+		Ball->Touch(Dir * FMath::FRandRange(350.f, 700.f));
+	}
+	else
+	{
+		// Не справился: мяч отскакивает от ноги
+		ControlCooldown = 0.4f;
+		FVector Bounce = Ball->Velocity.MirrorByVector(ToBall.GetSafeNormal()) * 0.45f;
+		Bounce = Bounce.RotateAngleAxis(FMath::FRandRange(-30.f, 30.f), FVector::UpVector);
+		Ball->Kick(this, Bounce);
+	}
+}
+
+// ВЕДЕНИЕ КАСАНИЯМИ: мяч не «приклеен» — игрок толкает его вперёд и догоняет.
+// Трусцой мяч уходит на ~0.8 м, в спринте — на ~1.3 м (накидка), LT — у самой ноги.
+// Между касаниями мяч свободно катится: его можно выбить, а резко развернуться с ним нельзя.
+void ASoccerPlayer::TickDribble(float Dt)
+{
+	ASoccerBall* Ball = GM()->Ball;
+	const FVector Me = GetActorLocation();
+	const FVector BallLoc = Ball->GetActorLocation();
+	FVector ToBall = BallLoc - Me;
+	ToBall.Z = 0.f;
+	const float Dist = ToBall.Size();
+
+	// Мяч укатился слишком далеко — контроль потерян, его может подобрать любой
+	if (Dist > 260.f)
+	{
+		Ball->SetOwnerPlayer(nullptr);
+		return;
+	}
+	if (BallLoc.Z > 60.f) return; // мяч ещё не опустился после приёма
+
+	const FVector Vel(GetVelocity().X, GetVelocity().Y, 0.f);
+	const float Speed = Vel.Size();
+
+	if (Speed < 60.f)
+	{
+		// Стоим — придерживаем мяч у ног
+		if (Dist < 120.f)
+		{
+			Ball->HoldAt(Me + GetActorForwardVector() * (bCloseControl ? 40.f : 50.f), Dt);
+		}
+		return;
+	}
+
+	// Догнали мяч — касание по ходу движения
+	const FVector MoveDir = Vel / Speed;
+	const float Ahead = FVector::DotProduct(ToBall, MoveDir);
+	if (Dist < 80.f && Ahead < 55.f && TouchCooldown <= 0.f)
+	{
+		float Mult = bSprinting ? 1.6f : 1.4f;
+		if (bCloseControl) Mult = 1.15f;
+		Mult *= FMath::Lerp(1.08f, 0.94f, Info.Dribbling / 100.f); // хороший дриблёр держит мяч ближе
+		Ball->Touch(MoveDir * Speed * Mult);
+		TouchCooldown = 0.15f;
+	}
+}
+
+// Отложенный удар: бежим к мячу и бьём, как только нога его достаёт.
+// Возвращает true, пока сама управляет движением игрока.
+bool ASoccerPlayer::TickPendingKick(float Dt)
+{
+	if (!bPendingKick) return false;
+
+	PendingTime -= Dt;
+	if (PendingTime <= 0.f || !HasBall())
+	{
+		bPendingKick = false;
+		return false;
+	}
+	if (CanKickBall())
+	{
+		ExecuteQueued();
+		return true;
+	}
+	GetCharacterMovement()->bOrientRotationToMovement = true;
+	MoveTo(GM()->Ball->GetActorLocation(), RunSpeed * 1.1f);
+	return true;
+}
+
+void ASoccerPlayer::QueueKick(ECharge Kind, const FVector& AimDir, float Power01, bool bFinesse, bool bChip)
+{
+	bPendingKick = true;
+	PendingKind = Kind;
+	PendingAim = AimDir;
+	PendingPower = Power01;
+	bPendingFinesse = bFinesse;
+	bPendingChip = bChip;
+	PendingTime = 0.8f;
+}
+
+void ASoccerPlayer::ExecuteQueued()
+{
+	bPendingKick = false;
+	switch (PendingKind)
+	{
+	case ECharge::Pass:    Pass(EPassKind::Ground, PendingAim, PendingPower); break;
+	case ECharge::Through: Pass(EPassKind::Through, PendingAim, PendingPower); break;
+	case ECharge::Lob:     Pass(EPassKind::Lob, PendingAim, PendingPower); break;
+	case ECharge::Shot:    Shoot(PendingAim, PendingPower, bPendingFinesse, bPendingChip); break;
+	default: break;
+	}
+}
+
+// Рывок в фиксированном направлении (подкат, финт, выпад при отборе)
+void ASoccerPlayer::StartDash(const FVector& Dir, float Speed, float Time, bool bSlide, bool bTurn)
+{
+	DashDir = Dir.GetSafeNormal2D();
+	if (DashDir.IsNearlyZero()) DashDir = GetActorForwardVector();
+	DashSpeed = Speed;
+	DashTime = Time;
+	bSliding = bSlide;
+	if (bTurn)
+	{
+		SetActorRotation(DashDir.Rotation());
 	}
 }
 
@@ -780,73 +1157,6 @@ void ASoccerPlayer::UpdateBodyPose(float Dt)
 	const FQuat DiveTilt(FVector(1.f, 0.f, 0.f), FMath::DegreesToRadians(-75.f * DiveAlpha * DiveSign)); // голова вбок
 	const FVector Loc(55.f * SlideAlpha, 0.f, -GetCapsuleComponent()->GetUnscaledCapsuleHalfHeight());
 	GetMesh()->SetRelativeLocationAndRotation(Loc, DiveTilt * SlideTilt * Base);
-}
-
-// Рывок в фиксированном направлении (подкат, финт, выпад при отборе)
-void ASoccerPlayer::StartDash(const FVector& Dir, float Speed, float Time, bool bSlide, bool bTurn)
-{
-	DashDir = Dir.GetSafeNormal2D();
-	if (DashDir.IsNearlyZero()) DashDir = GetActorForwardVector();
-	DashSpeed = Speed;
-	DashTime = Time;
-	bSliding = bSlide;
-	if (bTurn)
-	{
-		SetActorRotation(DashDir.Rotation());
-	}
-}
-
-bool ASoccerPlayer::TickDash(float Dt)
-{
-	if (DashTime <= 0.f) return false;
-
-	DashTime -= Dt;
-	GetCharacterMovement()->bOrientRotationToMovement = !bGoalkeeper; // вратарь прыгает боком
-	GetCharacterMovement()->MaxWalkSpeed = DashSpeed;
-	AddMovementInput(DashDir, 1.f);
-
-	if (bSliding)
-	{
-		// Подкат: коснулись мяча — выбиваем его, владельца «сбиваем»
-		ASoccerBall* Ball = GM()->Ball;
-		const FVector B = Ball->GetActorLocation();
-		if (FVector::Dist2D(B, GetActorLocation()) < 100.f && B.Z < 60.f && Ball->OwnerPlayer != this)
-		{
-			ASoccerPlayer* Carrier = Ball->OwnerPlayer;
-			if (!Carrier || (Carrier->Team != Team && !Carrier->bGoalkeeper))
-			{
-				if (Carrier) Carrier->Stun(1.0f);
-				Ball->Kick(this, DashDir * 750.f);
-				DashTime = 0.f;
-			}
-		}
-		if (DashTime <= 0.f)
-		{
-			bSliding = false;
-			StunTime = 0.45f; // время подняться после подката
-		}
-	}
-	return true;
-}
-
-// Подобрать свободный мяч, оказавшийся у ног
-void ASoccerPlayer::TryControlBall()
-{
-	ASoccerBall* Ball = GM()->Ball;
-	if (Ball->OwnerPlayer) return;
-	if (Ball->LastKicker == this && Ball->TimeSinceKick() < 0.3f) return; // только что ударили сами
-
-	const FVector B = Ball->GetActorLocation();
-	const FVector ToBall = B - GetActorLocation();
-	if (ToBall.Size2D() > 70.f || B.Z > 80.f) return;
-
-	// Очень сильный удар соперника не принять — мяч отскакивает от корпуса
-	if (Ball->Velocity.Size() > 1900.f && Ball->LastKicker && Ball->LastKicker->Team != Team)
-	{
-		Ball->Kick(this, Ball->Velocity.MirrorByVector(ToBall.GetSafeNormal2D()) * 0.35f);
-		return;
-	}
-	GainBall();
 }
 
 void ASoccerPlayer::MoveTo(const FVector& Target, float Speed)
@@ -885,19 +1195,36 @@ void ASoccerPlayer::TickHuman(float Dt)
 	const bool bLT = PC->LTAxis > 0.3f;
 
 	FVector Move = PC->StickToWorld(PC->MoveInput);
-	float Speed = PC->SprintAxis > 0.3f ? SprintSpeed : RunSpeed;
+	const bool bWantSprint = PC->SprintAxis > 0.3f;
+	float Speed = bWantSprint ? SprintSpeedNow() : RunSpeed;
+	bSprinting = bWantSprint && !Move.IsNearlyZero();
 
-	bShielding = bHas && bLT;              // LT с мячом — укрывание корпусом
+	bShielding = bHas && bLT;              // LT с мячом — укрывание корпусом и короткие касания
+	bCloseControl = bShielding;
 	const bool bJockey = !bHas && bLT;     // LT без мяча — жокей (лицом к мячу)
 	bool bFaceBall = bJockey;
 
 	if (bShielding || bJockey)
 	{
 		Speed = SlowSpeed;
+		bSprinting = false;
 	}
 	else if (bHas)
 	{
 		Speed *= 0.93f; // с мячом чуть медленнее
+	}
+
+	// С мячом: если он откатился в сторону, игрок немного подтягивается к нему (как в FIFA)
+	if (bHas && !Move.IsNearlyZero())
+	{
+		FVector ToBall = BallLoc - GetActorLocation();
+		ToBall.Z = 0.f;
+		const float BallDist = ToBall.Size();
+		if (BallDist > 60.f && BallDist < 250.f &&
+		    FVector::DotProduct(ToBall.GetSafeNormal(), Move.GetSafeNormal()) > -0.2f)
+		{
+			Move = (Move.GetSafeNormal() + ToBall.GetSafeNormal() * 0.5f).GetSafeNormal() * Move.Size();
+		}
 	}
 
 	// A в обороне (удержание): сдерживание — встаём между мячом и своими воротами
@@ -958,6 +1285,7 @@ FVector ASoccerPlayer::FormationPoint() const
 void ASoccerPlayer::TickFieldAI(float Dt)
 {
 	bShielding = false;
+	bCloseControl = false;
 	GetCharacterMovement()->bOrientRotationToMovement = true;
 
 	if (HasBall())
@@ -968,6 +1296,16 @@ void ASoccerPlayer::TickFieldAI(float Dt)
 
 	ASoccerBall* Ball = GM()->Ball;
 	const FVector BallLoc = Ball->GetActorLocation();
+	const FVector Me = GetActorLocation();
+
+	// Мяч в воздухе рядом — играем головой: у чужих ворот — удар, иначе — скидка вперёд
+	if (CanHeadBall() && Ball->TimeSinceKick() > 0.15f)
+	{
+		const FVector OppGoal(AttackSign() * HalfLength, 0.f, 0.f);
+		const bool bNearGoal = FVector::Dist2D(Me, OppGoal) < 900.f;
+		Header(bNearGoal, bNearGoal ? (OppGoal - Me).GetSafeNormal2D() : FVector(AttackSign(), 0.f, 0.f));
+		return;
+	}
 
 	// Мяч в руках вратаря соперника — не толпимся у него, а занимаем позиции
 	if (Ball->OwnerPlayer && Ball->OwnerPlayer->bGoalkeeper && Ball->OwnerPlayer->Team != Team)
@@ -979,13 +1317,18 @@ void ASoccerPlayer::TickFieldAI(float Dt)
 	if (Ball->IntendedReceiver == this || ShouldChase())
 	{
 		// Бежим туда, где мяч будет через мгновение
-		MoveTo(BallLoc + Ball->Velocity * 0.3f, SprintSpeed * 0.9f);
+		bSprinting = true;
+		MoveTo(BallLoc + Ball->Velocity * 0.3f, SprintSpeedNow() * 0.95f);
 
-		// Мяч у соперника рядом — пробуем отобрать
-		if (Ball->OwnerPlayer && Ball->OwnerPlayer->Team != Team &&
-		    FVector::Dist2D(BallLoc, GetActorLocation()) < 120.f)
+		// Мяч у соперника: отбор, когда нога достаёт до мяча
+		if (Ball->OwnerPlayer && Ball->OwnerPlayer->Team != Team && FVector::Dist2D(BallLoc, Me) < 130.f)
 		{
-			Tackle();
+			FVector ToBall = BallLoc - Me;
+			ToBall.Z = 0.f;
+			if (FVector::Dist2D(Me + ToBall.GetSafeNormal() * 60.f, BallLoc) < 60.f)
+			{
+				Tackle();
+			}
 		}
 	}
 	else
@@ -1017,46 +1360,58 @@ void ASoccerPlayer::TickAIWithBall(float Dt)
 	const FVector OppGoal(AttackSign() * HalfLength, 0.f, 0.f);
 	const float DistGoal = FVector::Dist2D(Me, OppGoal);
 	const FVector ToGoal = (OppGoal - Me).GetSafeNormal2D();
+	float OppDist = 0.f;
+	ASoccerPlayer* Opp = NearestOpponent(OppDist);
+	bCloseControl = OppDist < 250.f; // соперник рядом — короткие касания
 
 	if (AIDecisionTimer <= 0.f)
 	{
 		// Близко к воротам — бьём в случайный угол
 		if (DistGoal < 850.f)
 		{
+			AIDecisionTimer = 1.f;
 			const float AimY = FMath::FRandRange(-0.9f, 0.9f) * GoalHalfWidth;
 			const FVector Aim = (FVector(OppGoal.X, AimY, 0.f) - Me).GetSafeNormal2D();
-			Shoot(Aim, FMath::FRandRange(0.6f, 1.f), false);
+			Shoot(Aim, FMath::FRandRange(0.5f, 0.95f), FMath::FRand() < 0.25f);
 			return;
 		}
 
 		// Соперник рядом — пытаемся отдать пас вперёд
-		float PressDist = 0.f;
-		NearestOpponent(PressDist);
-		if (PressDist < 200.f)
+		if (OppDist < 200.f)
 		{
 			AIDecisionTimer = 0.6f;
 			if (FindPassTarget(ToGoal) && FMath::FRand() < 0.6f)
 			{
-				Pass(EPassKind::Ground, ToGoal, 0.5f);
+				Pass(EPassKind::Ground, ToGoal, FMath::FRandRange(0.2f, 0.6f));
 				return;
 			}
 		}
 	}
 
 	// Ведём мяч к воротам, огибая ближайшего соперника
-	float OppDist = 0.f;
-	ASoccerPlayer* Opp = NearestOpponent(OppDist);
 	FVector Dir = ToGoal;
 	if (Opp && OppDist < 350.f)
 	{
 		const FVector Away = (Me - Opp->GetActorLocation()).GetSafeNormal2D();
 		Dir = (Dir + Away * 0.7f).GetSafeNormal2D();
 	}
-	MoveTo(Me + Dir * 300.f, RunSpeed * 0.95f);
+
+	// Мяч откатился не туда, куда бежим, — сначала к мячу
+	const FVector BallLoc = GM()->Ball->GetActorLocation();
+	FVector ToBall = BallLoc - Me;
+	ToBall.Z = 0.f;
+	if (ToBall.Size() > 70.f && FVector::DotProduct(ToBall.GetSafeNormal(), Dir) < 0.5f)
+	{
+		MoveTo(BallLoc, RunSpeed);
+		return;
+	}
+
+	bSprinting = !bCloseControl && DistGoal > 1200.f && Stamina > 0.4f;
+	MoveTo(Me + Dir * 300.f, bSprinting ? SprintSpeedNow() : RunSpeed * 0.95f);
 }
 
 // ---------------------------------------------------------------------------
-//  ИИ вратаря: стоит на линии ворот, смещается за мячом, отбивает
+//  ИИ вратаря: стоит на линии ворот, смещается за мячом, прыгает, ловит
 // ---------------------------------------------------------------------------
 void ASoccerPlayer::TickGoalkeeper(float Dt)
 {
@@ -1155,6 +1510,7 @@ void ASoccerPlayer::TickGoalkeeper(float Dt)
 
 	TryKeeperSave();
 }
+
 
 // Вратарь решает один раз на каждый удар, возьмёт ли он мяч.
 // Базовый шанс по сложности; сильный удар, удар в угол и удар в упор его снижают.
@@ -1264,7 +1620,23 @@ ASoccerPlayer* ASoccerPlayer::FindPassTarget(const FVector& AimDir) const
 	return Best;
 }
 
-FSoccerKick ASoccerPlayer::PlanPass(EPassKind Kind, const FVector& AimDir, float Power01) const
+// Разброс направления удара/паса в градусах: навык, сила, угол корпуса к цели,
+// прессинг соперника, удар в одно касание и удар на спринте
+float ASoccerPlayer::KickErrorDegrees(int32 Skill, float Power01, const FVector& Dir, bool bFirstTime) const
+{
+	float Err = FMath::Lerp(9.f, 1.5f, FMath::Clamp((Skill - 40) / 59.f, 0.f, 1.f));  // 40 — 9°, 99 — 1.5°
+	Err *= FMath::Lerp(0.7f, 1.4f, FMath::Clamp(Power01, 0.f, 1.f));                   // сильнее — неточнее
+	const float Facing = FVector::DotProduct(GetActorForwardVector(), Dir.GetSafeNormal2D());
+	Err *= FMath::Lerp(2.f, 1.f, FMath::Clamp((Facing + 0.2f) / 1.2f, 0.f, 1.f));    // бьёт не туда, куда смотрит
+	float OppDist = 0.f;
+	NearestOpponent(OppDist);
+	if (OppDist < 150.f) Err *= 1.35f;                                                  // прессинг
+	if (bFirstTime) Err *= 1.25f;                                                       // в одно касание
+	if (GetVelocity().Size2D() > RunSpeed * 1.1f) Err *= 1.2f;                          // на спринте
+	return Err;
+}
+
+FSoccerKick ASoccerPlayer::PlanPass(EPassKind Kind, const FVector& AimDir, float Power01, bool bWithError) const
 {
 	FSoccerKick Plan;
 	const ASoccerBall* Ball = GM()->Ball;
@@ -1300,16 +1672,25 @@ FSoccerKick ASoccerPlayer::PlanPass(EPassKind Kind, const FVector& AimDir, float
 	FVector Flat = Target - From;
 	Flat.Z = 0.f;
 	const float Dist = FMath::Max(1.f, (float)Flat.Size());
-	const FVector Dir = Flat / Dist;
+	FVector Dir = Flat / Dist;
+	if (bWithError)
+	{
+		const float Err = KickErrorDegrees(Info.Passing, Power, Dir, !HasBall());
+		Dir = Dir.RotateAngleAxis((FMath::FRand() - FMath::FRand()) * Err, FVector::UpVector);
+	}
 
 	if (Kind == EPassKind::Lob)
 	{
-		// Навес: время полёта T = 2*Vz/g, горизонтальная скорость = дальность / T.
-		// Даже самый слабый навес долетает до партнёра, сильный — уходит на ход дальше.
+		// Навес с нижним вращением: мяч «парит» и гасится при приземлении.
+		// Время полёта T = 2·Vz/g, где g уменьшена подъёмной силой от вращения; +5% на сопротивление воздуха.
+		const float BackSpin = 10.f;
 		const float Land = Mate ? Dist * FMath::Lerp(1.f, 1.2f, Power) : Dist;
 		const float Vz = FMath::Clamp(400.f + Land * 0.25f, 500.f, 950.f);
-		const float T = 2.f * Vz / Ball->Gravity;
-		Plan.Velocity = Dir * (Land / T) + FVector(0.f, 0.f, Vz);
+		const float Estimate = Land / (2.f * Vz / Ball->Gravity);
+		const float GEff = FMath::Max(600.f, Ball->Gravity - Ball->MagnusCoeff * BackSpin * Estimate);
+		const float Horizontal = Land / (2.f * Vz / GEff) * 1.05f;
+		Plan.Velocity = Dir * Horizontal + FVector(0.f, 0.f, Vz);
+		Plan.Spin = -FVector::CrossProduct(FVector::UpVector, Dir) * BackSpin;
 	}
 	else
 	{
@@ -1320,11 +1701,12 @@ FSoccerKick ASoccerPlayer::PlanPass(EPassKind Kind, const FVector& AimDir, float
 		const float Speed = Mate ? (Dist * Ball->RollingFriction + Arrive) * FMath::Lerp(1.f, 1.4f, Power)
 		                         : Dist * Ball->RollingFriction + 250.f;
 		Plan.Velocity = Dir * FMath::Clamp(Speed, 700.f, 2800.f);
+		Plan.Spin = FVector::CrossProduct(FVector::UpVector, Plan.Velocity) / BallRadius; // катится
 	}
 	return Plan;
 }
 
-FSoccerKick ASoccerPlayer::PlanShot(const FVector& AimDir, float Power01, bool bFinesse, bool bWithError) const
+FSoccerKick ASoccerPlayer::PlanShot(const FVector& AimDir, float Power01, bool bFinesse, bool bChip, bool bWithError) const
 {
 	FSoccerKick Plan;
 	const ASoccerBall* Ball = GM()->Ball;
@@ -1332,11 +1714,7 @@ FSoccerKick ASoccerPlayer::PlanShot(const FVector& AimDir, float Power01, bool b
 	const float Power = FMath::Clamp(Power01, 0.f, 1.f);
 
 	// Куда в створ: поперечная составляющая стика выбирает угол ворот
-	float AimY = FMath::Clamp((float)AimDir.Y * 2.f, -1.f, 1.f) * GoalHalfWidth * 0.8f;
-	if (bWithError && !bFinesse)
-	{
-		AimY += FMath::FRandRange(-1.f, 1.f) * 50.f * Power; // сильный удар — менее точный
-	}
+	const float AimY = FMath::Clamp((float)AimDir.Y * 2.f, -1.f, 1.f) * GoalHalfWidth * 0.8f;
 	const FVector Target(AttackSign() * HalfLength, AimY, 0.f);
 	Plan.Target = Target;
 
@@ -1345,55 +1723,146 @@ FSoccerKick ASoccerPlayer::PlanShot(const FVector& AimDir, float Power01, bool b
 	const float Dist = FMath::Max(1.f, (float)Flat.Size());
 	FVector Dir = Flat / Dist;
 
+	float Err = 0.f;
+	if (bWithError)
+	{
+		Err = KickErrorDegrees(Info.Shooting, Power, Dir, !HasBall()) * (bFinesse ? 0.7f : 1.f);
+		Dir = Dir.RotateAngleAxis((FMath::FRand() - FMath::FRand()) * Err, FVector::UpVector);
+	}
+
 	// Характеристика УДР: 50 -> 0.85, 99 -> 1.14 от базовой силы удара
 	const float ShotFactor = FMath::Clamp(0.85f + (Info.Shooting - 50) * 0.006f, 0.8f, 1.15f);
-	float Speed = FMath::Lerp(1300.f, 3000.f, Power) * ShotFactor;
-	float Lift = Power * 250.f + (Dist > 1500.f ? 150.f : 0.f);
+	const FVector Topspin = FVector::CrossProduct(FVector::UpVector, Dir); // ось верхнего вращения
+	float Speed;
+	float TargetZ;     // на какой высоте мяч должен пересечь линию ворот
+	float SpinGravity; // добавка к гравитации от вращения (верхнее — вниз, нижнее — вверх)
+
+	if (bChip)
+	{
+		// «Парашют» (LB + B): мягкий высокий удар с нижним вращением — через вышедшего вратаря
+		Speed = FMath::Lerp(900.f, 1300.f, Power);
+		TargetZ = 170.f;
+		Plan.Spin = -Topspin * 12.f;
+		SpinGravity = -Ball->MagnusCoeff * 12.f * Speed;
+	}
+	else if (bFinesse)
+	{
+		// Изящный удар (RB + B): медленнее, точнее, с боковым вращением — заворачивает в угол
+		Speed = FMath::Lerp(1300.f, 3000.f, Power) * ShotFactor * 0.8f;
+		TargetZ = 110.f;
+		SpinGravity = 0.f;
+	}
+	else
+	{
+		// Обычный удар с верхним вращением: мяч «ныряет»; чем сильнее — тем выше целимся
+		Speed = FMath::Lerp(1300.f, 3000.f, Power) * ShotFactor;
+		TargetZ = FMath::Lerp(40.f, 150.f, Power);
+		Plan.Spin = Topspin * 15.f;
+		SpinGravity = Ball->MagnusCoeff * 15.f * Speed;
+	}
+	if (bWithError)
+	{
+		TargetZ += (FMath::FRand() - FMath::FRand()) * Err * 12.f; // разброс по высоте
+	}
+
+	// Подбираем вертикальную скорость, чтобы на линии ворот мяч был на высоте TargetZ.
+	// Время полёта с учётом сопротивления воздуха (~7%).
+	const float T = Dist / (Speed * 0.93f);
+	const float GEff = Ball->Gravity + SpinGravity;
+	const float Vz = (TargetZ - From.Z + 0.5f * GEff * T * T) / T;
 
 	if (bFinesse)
 	{
-		// ИЗЯЩНЫЙ УДАР (RB + B): медленнее, точнее и с закруткой.
-		// Отклоняем старт на A градусов «наружу» и компенсируем боковым ускорением c:
-		// −v·sin(A)·T + c·T²/2 = 0  =>  c = 2·v·sin(A) / T   (приближённо, без учёта трения)
-		Speed *= 0.8f;
-		Lift = 120.f;
+		// Отклоняем старт на A градусов наружу и закручиваем боковым вращением обратно в створ:
+		// −v·sin(A)·T + a·T²/2 = 0  =>  a = 2·v·sin(A)/T,  a = k·ω·v  =>  ω = 2·sin(A)/(k·T)
 		const float Angle = FMath::DegreesToRadians(12.f);
-		const float T = Dist / Speed;
 		FVector Perp = FVector::CrossProduct(FVector::UpVector, Dir);
-		if (Perp.Y * AimY > 0.f) Perp = -Perp; // стартуем от центра ворот наружу
+		float SpinSign = 1.f;
+		if (Perp.Y * AimY > 0.f)
+		{
+			Perp = -Perp; // стартуем от центра ворот наружу
+			SpinSign = -1.f;
+		}
 		Dir = (Dir * FMath::Cos(Angle) - Perp * FMath::Sin(Angle)).GetSafeNormal();
-		Plan.Curve = Perp * (2.f * Speed * FMath::Sin(Angle) / T);
-		Plan.CurveTime = T;
+		Plan.Spin = FVector(0.f, 0.f, SpinSign * 2.f * FMath::Sin(Angle) / (Ball->MagnusCoeff * T));
 	}
 
-	Plan.Velocity = Dir * Speed + FVector(0.f, 0.f, Lift);
+	Plan.Velocity = Dir * Speed + FVector(0.f, 0.f, Vz);
 	return Plan;
 }
 
 void ASoccerPlayer::ExecuteKick(const FSoccerKick& Plan)
 {
 	ASoccerBall* Ball = GM()->Ball;
+	bPendingKick = false;
 	SetActorRotation(FRotator(0.f, Plan.Velocity.GetSafeNormal2D().Rotation().Yaw, 0.f));
-	Ball->Kick(this, Plan.Velocity, Plan.Curve, Plan.CurveTime);
+	Ball->Kick(this, Plan.Velocity, Plan.Spin);
 	Ball->IntendedReceiver = Plan.Receiver; // ИИ-партнёр побежит принимать
 }
 
 void ASoccerPlayer::Pass(EPassKind Kind, const FVector& AimDir, float Power01)
 {
-	if (!CanKickBall()) return;
-	ExecuteKick(PlanPass(Kind, AimDir, Power01));
+	if (!CanKickBall())
+	{
+		// Мяч наш, но укатился вперёд — добегаем и отдаём пас
+		if (HasBall())
+		{
+			const ECharge Kick = Kind == EPassKind::Ground ? ECharge::Pass : (Kind == EPassKind::Through ? ECharge::Through : ECharge::Lob);
+			QueueKick(Kick, AimDir, Power01, false, false);
+		}
+		return;
+	}
+	ExecuteKick(PlanPass(Kind, AimDir, Power01, true));
 	if (IsPlayerControlled())
 	{
 		GM()->OnHumanPass();
 	}
 }
 
-void ASoccerPlayer::Shoot(const FVector& AimDir, float Power01, bool bFinesse)
+void ASoccerPlayer::Shoot(const FVector& AimDir, float Power01, bool bFinesse, bool bChip)
 {
-	if (!CanKickBall()) return;
-	ExecuteKick(PlanShot(AimDir, Power01, bFinesse, true));
+	if (!CanKickBall())
+	{
+		if (HasBall())
+		{
+			QueueKick(ECharge::Shot, AimDir, Power01, bFinesse, bChip);
+		}
+		return;
+	}
+	ExecuteKick(PlanShot(AimDir, Power01, bFinesse, bChip, true));
 }
 
+// Игра головой: прыжок и удар по мячу в воздухе — слабее и менее точно, чем ногой.
+// Удар по воротам — сверху вниз, скидка — к партнёру по направлению.
+void ASoccerPlayer::Header(bool bShot, const FVector& AimDir)
+{
+	if (!CanHeadBall()) return;
+	ASoccerBall* Ball = GM()->Ball;
+	LaunchCharacter(FVector(0.f, 0.f, 380.f), false, true);
+
+	FSoccerKick Plan;
+	FVector Dir = AimDir.IsNearlyZero() ? GetActorForwardVector() : AimDir.GetSafeNormal2D();
+	float Speed = 1100.f;
+	if (bShot)
+	{
+		const FVector Goal(AttackSign() * HalfLength, FMath::Clamp((float)AimDir.Y * 2.f, -1.f, 1.f) * GoalHalfWidth * 0.7f, 0.f);
+		Dir = (Goal - Ball->GetActorLocation()).GetSafeNormal2D();
+		Speed = 1600.f * FMath::Clamp(0.85f + (Info.Shooting - 50) * 0.006f, 0.8f, 1.15f);
+	}
+	else if (ASoccerPlayer* Mate = FindPassTarget(Dir))
+	{
+		Dir = (Mate->GetActorLocation() - Ball->GetActorLocation()).GetSafeNormal2D();
+		Plan.Receiver = Mate;
+	}
+	const float Err = KickErrorDegrees(bShot ? Info.Shooting : Info.Passing, 0.6f, Dir, true) * 1.5f;
+	Dir = Dir.RotateAngleAxis((FMath::FRand() - FMath::FRand()) * Err, FVector::UpVector);
+
+	Plan.Velocity = Dir * Speed + FVector(0.f, 0.f, bShot ? -150.f : 150.f);
+	ExecuteKick(Plan);
+}
+
+// Отбор ногой: игрок выставляет ногу к мячу. Достал мяч — чистый отбор (кто сильнее, тот и забрал,
+// иначе мяч отскакивает свободным). Не достал мяч, но попал в ноги (особенно сзади) — фол.
 void ASoccerPlayer::Tackle()
 {
 	if (TackleCooldown > 0.f) return;
@@ -1404,41 +1873,58 @@ void ASoccerPlayer::Tackle()
 	ASoccerPlayer* Carrier = Ball->OwnerPlayer;
 	if (!Carrier || Carrier->Team == Team || Carrier->bGoalkeeper) return; // мяч в руках вратаря не отнять
 
-	const FVector ToCarrier = Carrier->GetActorLocation() - GetActorLocation();
-	if (ToCarrier.Size2D() > 140.f)
+	const FVector Me = GetActorLocation();
+	const FVector CarrierLoc = Carrier->GetActorLocation();
+	const FVector BallLoc = Ball->GetActorLocation();
+	FVector ToBall = BallLoc - Me;
+	ToBall.Z = 0.f;
+	if (FVector::Dist2D(Me, CarrierLoc) > 170.f)
 	{
-		StartDash(ToCarrier, 800.f, 0.15f, false); // далеко — короткий выпад к сопернику
+		StartDash(ToBall, 800.f, 0.15f, false); // далеко — короткий выпад к сопернику
 		return;
 	}
 
-	// Шанс отбора: человеку проще; у ИИ соперника зависит от сложности.
-	// ЗАЩ отбирающего повышает шанс, укрывание мяча, финт и ФИЗ владельца — снижают.
-	static const float AIChances[3] = { 0.25f, 0.35f, 0.45f };
-	float Chance = IsPlayerControlled() ? 0.7f
-	             : (Team == HumanTeam ? 0.35f : AIChances[FMath::Clamp(G->GetDifficulty(), 0, 2)]);
-	Chance *= Info.Defending / 75.f;
-	Chance *= FMath::Clamp(1.4f - Carrier->Info.Physical / 150.f, 0.6f, 1.2f);
-	if (Carrier->IsShielding()) Chance *= 0.45f;
-	if (Carrier->ProtectTime > 0.f) Chance *= 0.2f;
+	SetActorRotation(FRotator(0.f, ToBall.Rotation().Yaw, 0.f));
+	const FVector Foot = Me + ToBall.GetSafeNormal() * 60.f;
+	float Reach = 70.f + (Info.Defending - 60) * 0.6f;
+	if (Carrier->IsShielding()) Reach -= 25.f;     // мяч прикрыт корпусом
+	if (Carrier->ProtectTime > 0.f) Reach -= 30.f; // соперник только что сделал финт
 
-	// Толчок плечом
-	Carrier->LaunchCharacter(ToCarrier.GetSafeNormal2D() * 350.f, true, false);
+	if (FVector::Dist2D(Foot, BallLoc) < Reach)
+	{
+		Ball->SetOwnerPlayer(nullptr);
+		Carrier->Stun(0.3f);
+		const float Strength = (Info.Physical + Info.Defending) * 0.5f - Carrier->Info.Physical;
+		if (FMath::FRand() < 0.5f + Strength / 100.f)
+		{
+			GainBall();
+			Ball->Touch(ToBall.GetSafeNormal() * 200.f);
+		}
+		else
+		{
+			const FVector Loose = ToBall.GetSafeNormal().RotateAngleAxis(FMath::FRandRange(-60.f, 60.f), FVector::UpVector);
+			Ball->Kick(this, Loose * FMath::FRandRange(350.f, 650.f));
+		}
+		return;
+	}
 
-	if (FMath::FRand() < Chance)
+	// Мимо мяча. Сзади или в упор по ногам — фол, иначе просто провалились в отборе
+	FVector ToCarrier = CarrierLoc - Me;
+	ToCarrier.Z = 0.f;
+	const bool bFromBehind = FVector::DotProduct(Carrier->GetActorForwardVector(), ToCarrier.GetSafeNormal()) > 0.5f;
+	if (ToCarrier.Size() < 90.f && (bFromBehind || FMath::FRand() < 0.35f))
 	{
-		Carrier->Stun(0.5f);
-		GainBall();
+		G->OnFoul(this, Carrier);
+		return;
 	}
-	else
-	{
-		Stun(0.25f); // промахнулись — теряем равновесие
-	}
+	Stun(0.3f);
 }
 
 void ASoccerPlayer::SlideTackle(const FVector& Dir)
 {
 	if (bSliding || TackleCooldown > 0.f) return;
 	TackleCooldown = 1.2f;
+	bSlideResolved = false;
 	StartDash(Dir.IsNearlyZero() ? GetActorForwardVector() : Dir, 1100.f, 0.5f, true);
 	SlidePoseTime = 0.5f + 0.45f; // скольжение + время подняться
 }
@@ -1446,11 +1932,18 @@ void ASoccerPlayer::SlideTackle(const FVector& Dir)
 void ASoccerPlayer::SkillMove(const FVector& Dir, bool bBig)
 {
 	if (!HasBall() || SkillCooldown > 0.f) return;
-	// Финт: резкий уход с мячом в сторону щелчка правого стика.
-	// С RB — более длинный финт и более долгая защита от отбора. ДРБ сокращает перезарядку.
+	// Финт: откидка мяча в сторону щелчка правого стика, игрок уходит за ним.
+	// С RB — длиннее и дольше защищает от отбора. ДРБ сокращает перезарядку.
 	const float DribbleFactor = FMath::Clamp(1.2f - Info.Dribbling / 250.f, 0.8f, 1.f);
 	SkillCooldown = (bBig ? 0.9f : 0.5f) * DribbleFactor;
 	ProtectTime   = bBig ? 0.5f : 0.25f;
+
+	ASoccerBall* Ball = GM()->Ball;
+	if (FVector::Dist2D(Ball->GetActorLocation(), GetActorLocation()) < 120.f)
+	{
+		Ball->Touch(Dir.GetSafeNormal2D() * (bBig ? 750.f : 550.f));
+		TouchCooldown = 0.3f;
+	}
 	StartDash(Dir, bBig ? 1000.f : 750.f, bBig ? 0.3f : 0.2f, false);
 }
 
@@ -1534,7 +2027,7 @@ void ASoccerPlayerController::SetupInputComponent()
 	Map(IA_LT, EKeys::LeftControl);
 	Map(IA_RB, EKeys::Gamepad_RightShoulder);        // RB / R1 — модификатор / прессинг партнёром
 	Map(IA_RB, EKeys::R);
-	Map(IA_LB, EKeys::Gamepad_LeftShoulder);         // LB / L1 — смена игрока
+	Map(IA_LB, EKeys::Gamepad_LeftShoulder);         // LB / L1 — смена игрока; LB + B — удар «парашютом»
 	Map(IA_LB, EKeys::Tab);
 
 	// --- Кнопки (Xbox A/B/X/Y = PlayStation ✖/⭕/⬛/▲). Зажать — сила, отпустить — удар/пас ---
@@ -1576,6 +2069,7 @@ void ASoccerPlayerController::SetupInputComponent()
 	EIC->BindAction(IA_Y,      ETriggerEvent::Started,   this, &ASoccerPlayerController::OnY);
 	EIC->BindAction(IA_Y,      ETriggerEvent::Completed, this, &ASoccerPlayerController::OnYStop);
 	EIC->BindAction(IA_LB,     ETriggerEvent::Started,   this, &ASoccerPlayerController::OnLB);
+	EIC->BindAction(IA_LB,     ETriggerEvent::Completed, this, &ASoccerPlayerController::OnLBStop);
 	EIC->BindAction(IA_Start,  ETriggerEvent::Started,   this, &ASoccerPlayerController::OnStart);
 }
 
@@ -1621,7 +2115,7 @@ void ASoccerPlayerController::ResetInputState()
 {
 	MoveInput = RightInput = FVector2D::ZeroVector;
 	SprintAxis = LTAxis = 0.f;
-	bRBHeld = bContainHeld = bGKRushHeld = false;
+	bRBHeld = bLBHeld = bContainHeld = bGKRushHeld = false;
 	Charging = ECharge::None;
 	bRightStickArmed = true;
 	if (ASoccerGameMode* G = GM())
@@ -1668,14 +2162,15 @@ void ASoccerPlayerController::ReleaseCharge(ECharge Kind)
 	const float Power = GetCharge();
 	Charging = ECharge::None;
 
+	// Мяч наш, но между касаниями откатился — игрок добежит и ударит (см. ASoccerPlayer::QueueKick)
 	ASoccerPlayer* P = Current();
-	if (!P || !P->CanKickBall()) return;
+	if (!P || (!P->HasBall() && !P->CanKickBall())) return;
 	switch (Kind)
 	{
 	case ECharge::Pass:    P->Pass(EPassKind::Ground, AimDirection(), Power); break;
 	case ECharge::Through: P->Pass(EPassKind::Through, AimDirection(), Power); break;
 	case ECharge::Lob:     P->Pass(EPassKind::Lob, AimDirection(), Power); break;
-	case ECharge::Shot:    P->Shoot(AimDirection(), FMath::Max(0.15f, Power), bRBHeld); break;
+	case ECharge::Shot:    P->Shoot(AimDirection(), FMath::Max(0.15f, Power), bRBHeld, bLBHeld); break;
 	default: break;
 	}
 }
@@ -1698,10 +2193,11 @@ void ASoccerPlayerController::UpdateAimPreview()
 	FSoccerKick Plan;
 	switch (Charging)
 	{
-	case ECharge::Pass:    Plan = P->PlanPass(EPassKind::Ground, AimDirection(), Power); break;
-	case ECharge::Through: Plan = P->PlanPass(EPassKind::Through, AimDirection(), Power); break;
-	case ECharge::Lob:     Plan = P->PlanPass(EPassKind::Lob, AimDirection(), Power); break;
-	default:               Plan = P->PlanShot(AimDirection(), FMath::Max(0.15f, Power), bRBHeld, false); break;
+	// Стрелка показывает замысел — без случайного разброса по точности
+	case ECharge::Pass:    Plan = P->PlanPass(EPassKind::Ground, AimDirection(), Power, false); break;
+	case ECharge::Through: Plan = P->PlanPass(EPassKind::Through, AimDirection(), Power, false); break;
+	case ECharge::Lob:     Plan = P->PlanPass(EPassKind::Lob, AimDirection(), Power, false); break;
+	default:               Plan = P->PlanShot(AimDirection(), FMath::Max(0.15f, Power), bRBHeld, bLBHeld, false); break;
 	}
 
 	const FVector From = G->Ball->GetActorLocation();
@@ -1839,6 +2335,7 @@ void ASoccerPlayerController::OnA()
 	ASoccerPlayer* P = Current();
 	if (!P) return;
 	if (P->HasBall())          BeginCharge(ECharge::Pass);
+	else if (P->CanHeadBall()) P->Header(false, AimDirection());
 	else if (P->CanKickBall()) P->Pass(EPassKind::Ground, AimDirection(), 0.5f);
 	else                       bContainHeld = true;
 }
@@ -1848,13 +2345,14 @@ void ASoccerPlayerController::OnAStop()
 	ReleaseCharge(ECharge::Pass);
 }
 
-// --- B / ⭕: удар (зажать — сила; с RB — изящный) | мяч рядом — с лёта/головой | в обороне — отбор ---
+// --- B / ⭕: удар (зажать — сила; с RB — изящный, с LB — «парашют») | мяч рядом — с лёта/головой | в обороне — отбор ---
 void ASoccerPlayerController::OnB()
 {
 	ASoccerPlayer* P = Current();
 	if (!P) return;
 	if (P->HasBall())          BeginCharge(ECharge::Shot);
-	else if (P->CanKickBall()) P->Shoot(AimDirection(), 0.8f, bRBHeld);
+	else if (P->CanHeadBall()) P->Header(true, AimDirection());
+	else if (P->CanKickBall()) P->Shoot(AimDirection(), 0.8f, bRBHeld, bLBHeld);
 	else                       P->Tackle();
 }
 void ASoccerPlayerController::OnBStop() { ReleaseCharge(ECharge::Shot); }
@@ -1865,6 +2363,7 @@ void ASoccerPlayerController::OnX()
 	ASoccerPlayer* P = Current();
 	if (!P) return;
 	if (P->HasBall())          BeginCharge(ECharge::Lob);
+	else if (P->CanHeadBall()) P->Header(false, AimDirection());
 	else if (P->CanKickBall()) P->Pass(EPassKind::Lob, AimDirection(), 0.5f);
 	else                       P->SlideTackle(AimDirection());
 }
@@ -1876,6 +2375,7 @@ void ASoccerPlayerController::OnY()
 	ASoccerPlayer* P = Current();
 	if (!P) return;
 	if (P->HasBall())          BeginCharge(ECharge::Through);
+	else if (P->CanHeadBall()) P->Header(false, AimDirection());
 	else if (P->CanKickBall()) P->Pass(EPassKind::Through, AimDirection(), 0.5f);
 	else                       bGKRushHeld = true;
 }
@@ -1885,8 +2385,17 @@ void ASoccerPlayerController::OnYStop()
 	ReleaseCharge(ECharge::Through);
 }
 
-// --- LB / L1: переключиться на игрока, ближайшего к мячу ---
-void ASoccerPlayerController::OnLB() { SwitchPlayer(FVector::ZeroVector); }
+// --- LB / L1: переключиться на игрока, ближайшего к мячу. С мячом — модификатор (LB + B — «парашют») ---
+void ASoccerPlayerController::OnLB()
+{
+	bLBHeld = true;
+	const ASoccerPlayer* P = Current();
+	if (P && !P->HasBall() && !P->CanKickBall())
+	{
+		SwitchPlayer(FVector::ZeroVector);
+	}
+}
+void ASoccerPlayerController::OnLBStop() { bLBHeld = false; }
 
 // --- Start / Options: пауза ---
 void ASoccerPlayerController::OnStart()
@@ -1898,7 +2407,7 @@ void ASoccerPlayerController::OnStart()
 }
 
 // ============================================================================
-//  HUD: шкала силы под игроком, пока зажата кнопка удара/паса
+//  HUD: выносливость и шкала силы под игроком
 // ============================================================================
 
 void ASoccerHUD::DrawHUD()
@@ -1907,9 +2416,8 @@ void ASoccerHUD::DrawHUD()
 
 	const ASoccerPlayerController* PC = Cast<ASoccerPlayerController>(GetOwningPlayerController());
 	if (!PC || !Canvas) return;
-	const float Charge = PC->GetCharge();
-	const APawn* P = PC->GetPawn();
-	if (Charge < 0.f || !P) return;
+	const ASoccerPlayer* P = Cast<ASoccerPlayer>(PC->GetPawn());
+	if (!P) return;
 
 	// Точка под ногами игрока на экране
 	const FVector S = Project(P->GetActorLocation() - FVector(0.f, 0.f, 95.f));
@@ -1920,6 +2428,22 @@ void ASoccerHUD::DrawHUD()
 	const float H = 12.f * K;
 	const float X = S.X - W * 0.5f;
 	const float Y = S.Y + 12.f * K;
+
+	// Выносливость: тонкая полоска, видна, пока игрок не восстановился полностью
+	const float Stamina = P->GetStamina();
+	if (Stamina < 0.99f)
+	{
+		const float SW = 70.f * K;
+		const float SH = 4.f * K;
+		const float SX = S.X - SW * 0.5f;
+		const float SY = S.Y + 30.f * K;
+		const FLinearColor StaminaColor = Stamina > 0.3f ? FLinearColor(0.2f, 0.85f, 1.f) : FLinearColor(1.f, 0.35f, 0.1f);
+		DrawRect(FLinearColor(0.02f, 0.02f, 0.02f, 0.7f), SX, SY, SW, SH);
+		DrawRect(StaminaColor, SX, SY, SW * Stamina, SH);
+	}
+
+	const float Charge = PC->GetCharge();
+	if (Charge < 0.f) return;
 
 	// Цвет заполнения: зелёный -> жёлтый -> красный
 	const FLinearColor Green(0.3f, 1.f, 0.02f), Yellow(1.f, 0.85f, 0.f), Red(1.f, 0.1f, 0.02f);
@@ -2199,6 +2723,8 @@ void ASoccerGameMode::ReturnToMenu()
 	bInMatch = false;
 	bPlayActive = false;
 	bMatchOver = false;
+	EventBanner = 0.f;
+	SetPieceTaker.Reset();
 	if (AimLine) AimLine->HidePath();
 
 	SpawnLineup();
@@ -2252,7 +2778,8 @@ void ASoccerGameMode::StartMatch(ESoccerMode InMode, const FString& RivalName, i
 
 	Score[0] = Score[1] = 0;
 	TimeLeft = IsPractice() ? 60.f : Save->MatchMinutes * 60.f;
-	GoalBanner = 0.f;
+	EventBanner = 0.f;
+	SetPieceTaker.Reset();
 	ResultText = FText::GetEmpty();
 	bMatchOver = false;
 	bInMatch = true;
@@ -2612,10 +3139,117 @@ void ASoccerGameMode::OnGoalScored(int32 ScoringTeam)
 	if (!bInMatch || !bPlayActive) return; // мяч уже в сетке / матч окончен
 	Score[ScoringTeam]++;
 	bPlayActive = false;
-	GoalBanner = 2.f;
+	EventText = FText::FromString(TEXT("ГОЛ!"));
+	EventBanner = 2.f;
 	if (AimLine) AimLine->HidePath();
 	// Через 2 секунды — расстановка заново и розыгрыш с центра
 	GetWorldTimerManager().SetTimer(ResetTimer, this, &ASoccerGameMode::ResetPositions, 2.f, false);
+}
+
+// Фол: игра останавливается, через 1.5 с — штрафной с места нарушения
+// или пенальти, если сфолили в штрафной площади защищающейся команды.
+void ASoccerGameMode::OnFoul(ASoccerPlayer* Offender, ASoccerPlayer* Victim)
+{
+	if (!bInMatch || !bPlayActive || bMatchOver || !Victim || !Ball) return;
+
+	bPlayActive = false;
+	Victim->Stun(1.f);
+	if (Offender) Offender->Stun(0.f); // прервать подкат/рывок нарушителя
+	if (AimLine) AimLine->HidePath();
+
+	const FVector Spot = Victim->GetActorLocation();
+	const float Sign = Victim->AttackSign();
+	const float AttackX = Sign * HalfLength; // ворота, которые атакует пострадавший
+	bPenalty = FMath::Abs(AttackX - Spot.X) < PenaltyDepth && FMath::Abs(Spot.Y) < GoalHalfWidth + 400.f;
+
+	if (bPenalty)
+	{
+		SetPieceSpot = FVector(AttackX - Sign * PenaltyDepth, 0.f, BallRadius); // точка пенальти
+	}
+	else
+	{
+		SetPieceSpot = FVector(FMath::Clamp<double>(Spot.X, -HalfLength + 80.0, HalfLength - 80.0),
+		                       FMath::Clamp<double>(Spot.Y, -HalfWidth + 80.0, HalfWidth - 80.0), BallRadius);
+	}
+	SetPieceTaker = Victim;
+
+	EventText = FText::FromString(bPenalty ? TEXT("ПЕНАЛЬТИ!") : TEXT("ФОЛ!  Штрафной"));
+	EventBanner = 2.f;
+	GetWorldTimerManager().SetTimer(ResetTimer, this, &ASoccerGameMode::StartSetPiece, 1.5f, false);
+}
+
+void ASoccerGameMode::StartSetPiece()
+{
+	if (!bInMatch || bMatchOver) return;
+	ASoccerPlayer* Taker = SetPieceTaker.Get();
+	if (!Taker)
+	{
+		ResetPositions();
+		return;
+	}
+
+	const float Sign = Taker->AttackSign();
+	const FVector GoalCenter(Sign * HalfLength, 0.f, 0.f);
+
+	auto Place = [](ASoccerPlayer* P, const FVector& Loc, const FVector& LookAt)
+	{
+		const FVector Pos(Loc.X, Loc.Y, P->GetActorLocation().Z);
+		P->SetActorLocation(Pos, false, nullptr, ETeleportType::TeleportPhysics);
+		P->SetActorRotation(FRotator(0.f, (LookAt - Pos).Rotation().Yaw, 0.f));
+		P->GetCharacterMovement()->StopMovementImmediately();
+	};
+
+	// Все прерывают рывки/подкаты/отложенные удары, мяч — на точку
+	for (ASoccerPlayer* P : Players)
+	{
+		if (P) P->Stun(0.f);
+	}
+	Ball->ResetBall(SetPieceSpot);
+
+	int32 Slot = 0;
+	for (ASoccerPlayer* P : Players)
+	{
+		if (!P || P == Taker) continue;
+		const FVector Loc = P->GetActorLocation();
+
+		if (bPenalty)
+		{
+			if (P->bGoalkeeper && P->Team != Taker->Team)
+			{
+				Place(P, FVector(GoalCenter.X - Sign * 40.f, 0.f, 0.f), SetPieceSpot); // вратарь — на линии ворот
+			}
+			else if (!P->bGoalkeeper)
+			{
+				// Остальные — за пределами штрафной, позади точки пенальти
+				const float Y = (Slot % 2 ? 1.f : -1.f) * (250.f + 180.f * (Slot / 2));
+				Place(P, FVector(SetPieceSpot.X - Sign * 500.f, Y, 0.f), GoalCenter);
+				++Slot;
+			}
+		}
+		else if (P->Team != Taker->Team)
+		{
+			// Штрафной: соперники — не ближе 5 м от мяча
+			FVector Away = Loc - SetPieceSpot;
+			Away.Z = 0.f;
+			if (Away.Size() < 500.f)
+			{
+				if (Away.IsNearlyZero()) Away = FVector(Sign, 0.f, 0.f);
+				FVector NewLoc = SetPieceSpot + Away.GetSafeNormal() * 500.f;
+				NewLoc.X = FMath::Clamp<double>(NewLoc.X, -HalfLength + 60.0, HalfLength - 60.0);
+				NewLoc.Y = FMath::Clamp<double>(NewLoc.Y, -HalfWidth + 60.0, HalfWidth - 60.0);
+				Place(P, NewLoc, SetPieceSpot);
+			}
+		}
+	}
+
+	// Исполнитель — пострадавший: у мяча, лицом к воротам соперника
+	const FVector ToGoal = (GoalCenter - SetPieceSpot).GetSafeNormal2D();
+	Place(Taker, SetPieceSpot - ToGoal * 70.f, GoalCenter);
+	Taker->GainBall();
+	Taker->ProtectTime = 1.f; // соперник не отбирает мяч в первую секунду
+
+	SetPieceTaker.Reset();
+	bPlayActive = true;
 }
 
 void ASoccerGameMode::OnHumanPass()
@@ -2642,6 +3276,7 @@ void ASoccerGameMode::ResetPositions()
 		P->ResetToHome();
 	}
 	Ball->ResetBall(FVector(0.f, 0.f, BallRadius));
+	SetPieceTaker.Reset();
 	bPlayActive = true;
 }
 
@@ -2755,7 +3390,7 @@ void ASoccerGameMode::Tick(float DeltaSeconds)
 	Super::Tick(DeltaSeconds);
 	if (!Ball) return;
 
-	GoalBanner = FMath::Max(0.f, GoalBanner - DeltaSeconds);
+	EventBanner = FMath::Max(0.f, EventBanner - DeltaSeconds);
 
 	// Таймер идёт только во время игры (пауза после гола не считается)
 	if (bInMatch && bPlayActive)
