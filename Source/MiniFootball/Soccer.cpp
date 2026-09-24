@@ -1,4 +1,5 @@
-﻿// Мини-футбол 5×5 — реализация. См. Soccer.h и README.md.
+﻿// Мини-футбол 5×5 — геймплей: мяч, ворота, игроки и ИИ, управление, режим игры, сохранения.
+// Интерфейс (меню, HUD матча, пауза) — в SoccerUI.cpp. Объявления — в Soccer.h.
 
 #include "Soccer.h"
 
@@ -6,20 +7,24 @@
 #include "Components/BoxComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/CapsuleComponent.h"
+#include "Components/LightComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Camera/CameraActor.h"
 #include "Camera/CameraComponent.h"
 #include "Engine/StaticMeshActor.h"
 #include "Engine/DirectionalLight.h"
-#include "Components/LightComponent.h"
-#include "EngineUtils.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/LocalPlayer.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
+#include "Engine/Canvas.h"
+#include "Engine/GameViewportClient.h"
+#include "EngineUtils.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "UObject/ConstructorHelpers.h"
 #include "TimerManager.h"
+#include "Kismet/GameplayStatics.h"
+#include "Kismet/KismetSystemLibrary.h"
 #include "InputCoreTypes.h"
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
@@ -27,6 +32,7 @@
 #include "InputAction.h"
 #include "InputModifiers.h"
 #include "InputActionValue.h"
+#include "Widgets/SWidget.h"
 
 using namespace Soccer;
 
@@ -39,6 +45,8 @@ using namespace Soccer;
 #define MESH_SPHERE   TEXT("/Engine/BasicShapes/Sphere.Sphere")
 #define MESH_CYLINDER TEXT("/Engine/BasicShapes/Cylinder.Cylinder")
 #define MESH_CONE     TEXT("/Engine/BasicShapes/Cone.Cone")
+
+static const TCHAR* SaveSlot = TEXT("MiniFootball");
 
 // Покрасить меш: динамический экземпляр стандартного материала BasicShapeMaterial,
 // у которого есть векторный параметр "Color".
@@ -66,12 +74,107 @@ static UStaticMeshComponent* MakeVisual(AActor* Owner, USceneComponent* Parent, 
 	return C;
 }
 
-// Точка внутри поля (с отступом от бортов)
+// Точка внутри поля (с отступом от линий)
 static FVector ClampToField(FVector P, float Margin = 60.f)
 {
 	P.X = FMath::Clamp<double>(P.X, -HalfLength + Margin, HalfLength - Margin);
 	P.Y = FMath::Clamp<double>(P.Y, -HalfWidth + Margin, HalfWidth - Margin);
 	return P;
+}
+
+// ----------------------------------------------------------------------------
+//  Справочники: формы, клубы, имена
+// ----------------------------------------------------------------------------
+
+const TArray<FSoccerKit>& GetSoccerKits()
+{
+	static const TArray<FSoccerKit> Kits = {
+		{ TEXT("Красная"),       FLinearColor(0.75f, 0.03f, 0.03f),  FLinearColor(0.9f, 0.9f, 0.9f),    0    },
+		{ TEXT("Белая"),         FLinearColor(0.85f, 0.85f, 0.85f),  FLinearColor(0.05f, 0.05f, 0.08f), 1000 },
+		{ TEXT("Зелёная"),       FLinearColor(0.03f, 0.4f, 0.1f),    FLinearColor(0.9f, 0.9f, 0.9f),    1200 },
+		{ TEXT("Чёрно-золотая"), FLinearColor(0.02f, 0.02f, 0.025f), FLinearColor(0.75f, 0.55f, 0.08f), 1500 },
+		{ TEXT("Фиолетовая"),    FLinearColor(0.25f, 0.03f, 0.45f),  FLinearColor(0.05f, 0.05f, 0.05f), 2000 },
+	};
+	return Kits;
+}
+
+const TArray<FString>& GetClubNames()
+{
+	static const TArray<FString> Names = {
+		TEXT("ФК Метеор"), TEXT("Спартак-Юг"), TEXT("Звезда"), TEXT("Торпедо"), TEXT("Легион"), TEXT("Вымпел")
+	};
+	return Names;
+}
+
+static const TArray<FString>& RivalClubNames()
+{
+	static const TArray<FString> Names = {
+		TEXT("Буревестник"), TEXT("Ракета"), TEXT("Атлант"), TEXT("Факел"), TEXT("Прибой"), TEXT("Сокол")
+	};
+	return Names;
+}
+
+static const TArray<FString>& SurnamePool()
+{
+	static const TArray<FString> Names = {
+		TEXT("Бойко"), TEXT("Мельник"), TEXT("Кравец"), TEXT("Зайцев"), TEXT("Титов"), TEXT("Панов"),
+		TEXT("Белов"), TEXT("Шестаков"), TEXT("Фомин"), TEXT("Жуков"), TEXT("Родин"), TEXT("Карпов"),
+		TEXT("Гусев"), TEXT("Носов"), TEXT("Яшин"), TEXT("Швецов"), TEXT("Демин"), TEXT("Соловьёв")
+	};
+	return Names;
+}
+
+static FSoccerPlayerInfo MakeInfo(const TCHAR* Name, const TCHAR* Pos,
+                                  int32 Pac, int32 Sho, int32 Pas, int32 Dri, int32 Def, int32 Phy)
+{
+	FSoccerPlayerInfo I;
+	I.Name = Name;
+	I.Position = Pos;
+	I.Pace = Pac; I.Shooting = Sho; I.Passing = Pas; I.Dribbling = Dri; I.Defending = Def; I.Physical = Phy;
+	return I;
+}
+
+// Стартовый состав нового игрока
+static TArray<FSoccerPlayerInfo> DefaultSquad()
+{
+	return {
+		MakeInfo(TEXT("Громов"),  TEXT("ВР"), 60, 40, 58, 45, 78, 75),
+		MakeInfo(TEXT("Ветров"),  TEXT("ЗЩ"), 72, 50, 64, 58, 76, 74),
+		MakeInfo(TEXT("Лебедев"), TEXT("ЗЩ"), 70, 48, 62, 60, 74, 78),
+		MakeInfo(TEXT("Орлов"),   TEXT("НП"), 84, 76, 70, 78, 40, 64),
+		MakeInfo(TEXT("Корнеев"), TEXT("НП"), 80, 72, 74, 80, 38, 60),
+	};
+}
+
+int32 FSoccerPlayerInfo::Rating() const
+{
+	if (Position == TEXT("ВР")) return (Defending * 3 + Physical * 2 + Pace + Passing) / 7;
+	if (Position == TEXT("ЗЩ")) return (Pace + Passing + Defending * 3 + Physical * 2) / 7;
+	return (Pace + Shooting * 2 + Passing + Dribbling * 2 + Physical) / 7;
+}
+
+int32& FSoccerPlayerInfo::Stat(int32 Index)
+{
+	switch (Index)
+	{
+	case 0:  return Pace;
+	case 1:  return Shooting;
+	case 2:  return Passing;
+	case 3:  return Dribbling;
+	case 4:  return Defending;
+	default: return Physical;
+	}
+}
+
+int32 FSoccerPlayerInfo::Stat(int32 Index) const
+{
+	return const_cast<FSoccerPlayerInfo*>(this)->Stat(Index);
+}
+
+const TCHAR* FSoccerPlayerInfo::StatLabel(int32 Index)
+{
+	static const TCHAR* Labels[6] = { TEXT("СКР"), TEXT("УДР"), TEXT("ПАС"), TEXT("ДРБ"), TEXT("ЗАЩ"), TEXT("ФИЗ") };
+	return Labels[FMath::Clamp(Index, 0, 5)];
 }
 
 // ============================================================================
@@ -157,103 +260,155 @@ void ASoccerBall::Tick(float Dt)
 		P = FMath::VInterpTo(P, Target, Dt, 25.f);
 		Velocity = OwnerPlayer->GetVelocity();
 		Velocity.Z = 0.f;
+		CollideWithWalls(P, OldP, Velocity);
 	}
 	else
 	{
-		// Закрутка (изящный удар): боковое ускорение в первые доли секунды полёта
-		if (CurveTimeLeft > 0.f)
-		{
-			Velocity += CurveAccel * Dt;
-			CurveTimeLeft -= Dt;
-		}
-
-		const bool bGrounded = P.Z <= BallRadius + 1.f && FMath::Abs(Velocity.Z) < 1.f;
-		if (!bGrounded)
-		{
-			Velocity.Z -= Gravity * Dt;
-		}
-
-		// Трение: на газоне — качение, в воздухе — слабое сопротивление.
-		// Экспоненциальное затухание: v(t) = v0 * e^(-k t) -> пройденный путь до остановки = v0 / k.
-		const float Damp = FMath::Exp(-(bGrounded ? RollingFriction : AirDrag) * Dt);
-		Velocity.X *= Damp;
-		Velocity.Y *= Damp;
-		if (bGrounded && Velocity.Size2D() < 15.f)
-		{
-			Velocity = FVector::ZeroVector; // мяч остановился
-		}
-
-		P += Velocity * Dt;
-
-		// Отскок от газона
-		if (P.Z < BallRadius)
-		{
-			P.Z = BallRadius;
-			if (Velocity.Z < -150.f)
-			{
-				Velocity.Z = -Velocity.Z * Bounciness;
-				Velocity.X *= 0.9f;
-				Velocity.Y *= 0.9f;
-			}
-			else
-			{
-				Velocity.Z = 0.f;
-			}
-		}
-
+		Integrate(P, Velocity, CurveAccel, CurveTimeLeft, Dt);
 		if (IntendedReceiver && TimeSinceKick() > 2.5f)
 		{
 			IntendedReceiver = nullptr; // пас «протух»
 		}
 	}
 
-	CollideWithWalls(P, OldP);
-
 	// Телепорт без sweep: оверлапы (триггер гола) всё равно обновляются.
 	SetActorLocation(P);
 }
 
-void ASoccerBall::CollideWithWalls(FVector& P, const FVector& OldP)
+void ASoccerBall::Integrate(FVector& P, FVector& V, const FVector& Curve, float& CurveTime, float Dt) const
 {
-	const float R = BallRadius;
+	const FVector OldP = P;
 
-	// Боковые борта (как в зале: мяч не уходит в аут, а отскакивает)
-	if (FMath::Abs(P.Y) > HalfWidth - R)
+	// Закрутка (изящный удар): боковое ускорение в первые доли секунды полёта
+	if (CurveTime > 0.f)
 	{
-		P.Y = FMath::Sign(P.Y) * (HalfWidth - R);
-		Velocity.Y = -FMath::Sign(P.Y) * FMath::Abs(Velocity.Y) * WallBounciness;
+		V += Curve * Dt;
+		CurveTime -= Dt;
 	}
 
-	// Лицевые борта: пропускаем мяч внутрь только через створ ворот
-	const bool bWasInGoal = FMath::Abs(OldP.X) > HalfLength;
-	if (!bWasInGoal && FMath::Abs(P.X) > HalfLength - R)
+	const bool bGrounded = P.Z <= BallRadius + 1.f && FMath::Abs(V.Z) < 1.f;
+	if (!bGrounded)
 	{
-		const bool bInMouth = FMath::Abs(P.Y) < GoalHalfWidth - R && P.Z < GoalHeight - R;
-		if (!bInMouth)
+		V.Z -= Gravity * Dt;
+	}
+
+	// Трение: на газоне — качение, в воздухе — слабое сопротивление.
+	// Экспоненциальное затухание: v(t) = v0 * e^(-k t) -> путь до остановки = v0 / k.
+	const float Damp = FMath::Exp(-(bGrounded ? RollingFriction : AirDrag) * Dt);
+	V.X *= Damp;
+	V.Y *= Damp;
+	if (bGrounded && V.Size2D() < 15.f)
+	{
+		V = FVector::ZeroVector; // мяч остановился
+	}
+
+	P += V * Dt;
+
+	// Отскок от газона
+	if (P.Z < BallRadius)
+	{
+		P.Z = BallRadius;
+		if (V.Z < -150.f)
 		{
-			P.X = FMath::Sign(P.X) * (HalfLength - R);
-			Velocity.X = -FMath::Sign(P.X) * FMath::Abs(Velocity.X) * WallBounciness;
+			V.Z = -V.Z * Bounciness;
+			V.X *= 0.9f;
+			V.Y *= 0.9f;
+		}
+		else
+		{
+			V.Z = 0.f;
 		}
 	}
 
-	// Внутри ворот — сетка гасит мяч
-	if (FMath::Abs(P.X) > HalfLength)
+	CollideWithWalls(P, OldP, V);
+}
+
+void ASoccerBall::CollideWithWalls(FVector& P, const FVector& OldP, FVector& V) const
+{
+	const float R = BallRadius;
+	const float WallY = HalfWidth + BoardGap;   // рекламные борта вдоль поля
+	const float WallX = HalfLength + GoalDepth; // борта за воротами
+
+	if (FMath::Abs(P.Y) > WallY - R)
 	{
+		P.Y = FMath::Sign(P.Y) * (WallY - R);
+		V.Y = -FMath::Sign(P.Y) * FMath::Abs(V.Y) * WallBounciness;
+	}
+	if (FMath::Abs(P.X) > WallX - R)
+	{
+		P.X = FMath::Sign(P.X) * (WallX - R);
+		V.X = -FMath::Sign(P.X) * FMath::Abs(V.X) * WallBounciness;
+	}
+
+	// Ворота — «коробка» за линией ворот
+	auto InGoal = [](const FVector& Q)
+	{
+		return FMath::Abs(Q.X) > HalfLength && FMath::Abs(Q.Y) < GoalHalfWidth && Q.Z < GoalHeight;
+	};
+
+	if (!InGoal(OldP) && InGoal(P))
+	{
+		// Внутрь можно только через створ — пересекая линию ворот со стороны поля
+		const bool bThroughMouth = FMath::Abs(OldP.X) <= HalfLength;
+		if (!bThroughMouth)
+		{
+			if (FMath::Abs(OldP.Y) >= GoalHalfWidth)
+			{
+				P.Y = FMath::Sign(OldP.Y) * (GoalHalfWidth + R); // боковая сетка снаружи
+				V.Y *= -0.3f;
+			}
+			else
+			{
+				P.Z = GoalHeight + R;                            // крыша ворот
+				V.Z = FMath::Abs(V.Z) * 0.3f;
+			}
+		}
+	}
+
+	if (InGoal(P))
+	{
+		// Внутри ворот сетка гасит мяч
 		const float Back = HalfLength + GoalDepth - R;
 		if (FMath::Abs(P.X) > Back)
 		{
 			P.X = FMath::Sign(P.X) * Back;
-			Velocity.X *= -0.2f;
+			V.X *= -0.2f;
 		}
 		if (FMath::Abs(P.Y) > GoalHalfWidth - R)
 		{
 			P.Y = FMath::Sign(P.Y) * (GoalHalfWidth - R);
-			Velocity.Y *= -0.2f;
+			V.Y *= -0.2f;
 		}
 		if (P.Z > GoalHeight - R)
 		{
 			P.Z = GoalHeight - R;
-			Velocity.Z = FMath::Min<double>(Velocity.Z, 0.0);
+			V.Z = FMath::Min<double>(V.Z, 0.0);
+		}
+	}
+}
+
+void ASoccerBall::PredictPath(const FVector& Start, const FVector& StartVelocity, const FVector& Curve,
+                              float CurveTime, TArray<FVector>& OutPoints) const
+{
+	// Прогоняем ту же физику вперёд на ~2.5 с, пока мяч не остановится или не пересечёт линию ворот
+	OutPoints.Reset();
+	FVector P = Start;
+	FVector V = StartVelocity;
+	float CT = CurveTime;
+	const float Dt = 1.f / 30.f;
+
+	OutPoints.Add(P);
+	for (int32 Step = 1; Step <= 75; ++Step)
+	{
+		Integrate(P, V, Curve, CT, Dt);
+		if (Step % 2 == 0)
+		{
+			OutPoints.Add(P);
+		}
+		if (FMath::Abs(P.X) > HalfLength || V.IsNearlyZero())
+		{
+			OutPoints.Add(P);
+			break;
 		}
 	}
 }
@@ -274,7 +429,7 @@ ASoccerGoal::ASoccerGoal()
 	const float MinX = BallRadius * 2.f;
 	Trigger = CreateDefaultSubobject<UBoxComponent>(TEXT("Trigger"));
 	Trigger->SetupAttachment(Root);
-	Trigger->SetBoxExtent(FVector((GoalDepth - MinX) * 0.5f, GoalHalfWidth, GoalHeight * 0.5f));
+	Trigger->SetBoxExtent(FVector((GoalDepth - MinX) * 0.5f, GoalHalfWidth - BallRadius, GoalHeight * 0.5f));
 	Trigger->SetRelativeLocation(FVector(MinX + (GoalDepth - MinX) * 0.5f, 0.f, GoalHeight * 0.5f));
 	Trigger->SetCollisionProfileName(TEXT("OverlapAllDynamic"));
 	Trigger->SetGenerateOverlapEvents(true);
@@ -308,7 +463,7 @@ void ASoccerGoal::BeginPlay()
 {
 	Super::BeginPlay();
 	for (UStaticMeshComponent* C : Posts) Paint(C, FLinearColor::White);
-	for (UStaticMeshComponent* C : Nets)  Paint(C, FLinearColor(0.6f, 0.6f, 0.6f));
+	for (UStaticMeshComponent* C : Nets)  Paint(C, FLinearColor(0.7f, 0.7f, 0.7f));
 	Trigger->OnComponentBeginOverlap.AddDynamic(this, &ASoccerGoal::OnTriggerOverlap);
 }
 
@@ -321,6 +476,65 @@ void ASoccerGoal::OnTriggerOverlap(UPrimitiveComponent* OverlappedComp, AActor* 
 	{
 		GameMode->OnGoalScored(1 - DefendingTeam);
 	}
+}
+
+// ============================================================================
+//  ЛИНИЯ ПРИЦЕЛА — цепочка тонких белых отрезков вдоль прогноза полёта мяча
+// ============================================================================
+
+ASoccerAimLine::ASoccerAimLine()
+{
+	Root = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
+	RootComponent = Root;
+
+	static ConstructorHelpers::FObjectFinder<UStaticMesh> Cube(MESH_CUBE);
+	for (int32 i = 0; i < MaxSegments; ++i)
+	{
+		UStaticMeshComponent* Seg = MakeVisual(this, Root, *FString::Printf(TEXT("Seg%d"), i), Cube.Object,
+		                                       FVector::ZeroVector, FVector(0.01f));
+		Seg->SetUsingAbsoluteLocation(true);
+		Seg->SetUsingAbsoluteRotation(true);
+		Seg->SetUsingAbsoluteScale(true);
+		Seg->SetCastShadow(false);
+		Seg->SetVisibility(false);
+		Segments.Add(Seg);
+	}
+}
+
+void ASoccerAimLine::BeginPlay()
+{
+	Super::BeginPlay();
+	for (UStaticMeshComponent* Seg : Segments) Paint(Seg, FLinearColor::White);
+}
+
+void ASoccerAimLine::ShowPath(const TArray<FVector>& Points)
+{
+	int32 Used = 0;
+	for (int32 i = 1; i < Points.Num() && Used < Segments.Num(); ++i)
+	{
+		// Линия идёт по газону (для навеса — по дуге полёта), чуть выше травы
+		FVector A = Points[i - 1];
+		FVector B = Points[i];
+		A.Z = FMath::Max<double>(A.Z - BallRadius, 0.0) + 2.0;
+		B.Z = FMath::Max<double>(B.Z - BallRadius, 0.0) + 2.0;
+		const FVector D = B - A;
+		const float Len = D.Size();
+		if (Len < 1.f) continue;
+
+		UStaticMeshComponent* Seg = Segments[Used++];
+		Seg->SetWorldLocationAndRotation((A + B) * 0.5f, D.Rotation());
+		Seg->SetWorldScale3D(FVector((Len + 2.f) / 100.f, 0.07f, 0.015f)); // ширина линии 7 см
+		Seg->SetVisibility(true);
+	}
+	for (int32 i = Used; i < Segments.Num(); ++i)
+	{
+		Segments[i]->SetVisibility(false);
+	}
+}
+
+void ASoccerAimLine::HidePath()
+{
+	for (UStaticMeshComponent* Seg : Segments) Seg->SetVisibility(false);
 }
 
 // ============================================================================
@@ -348,40 +562,41 @@ ASoccerPlayer::ASoccerPlayer()
 
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> Cyl(MESH_CYLINDER);
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> Sph(MESH_SPHERE);
-	static ConstructorHelpers::FObjectFinder<UStaticMesh> Cube(MESH_CUBE);
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> Cone(MESH_CONE);
 
-	// Визуальная «капсула» = цилиндр + две сферы
+	// Капсула «в форме»: футболка (цилиндр + плечи), шорты (нижняя полусфера), голова
 	USceneComponent* Parent = GetCapsuleComponent();
-	Body = MakeVisual(this, Parent, TEXT("Body"), Cyl.Object, FVector::ZeroVector, FVector(0.7f, 0.7f, 1.1f));
-	Head = MakeVisual(this, Parent, TEXT("Head"), Sph.Object, FVector(0.f, 0.f, 55.f), FVector(0.7f));
-	Feet = MakeVisual(this, Parent, TEXT("Feet"), Sph.Object, FVector(0.f, 0.f, -55.f), FVector(0.7f));
-	// «Нос» — показывает, куда смотрит игрок
-	Nose = MakeVisual(this, Parent, TEXT("Nose"), Cube.Object, FVector(35.f, 0.f, 45.f), FVector(0.25f, 0.2f, 0.15f));
+	Body = MakeVisual(this, Parent, TEXT("Body"), Cyl.Object, FVector(0.f, 0.f, -5.f), FVector(0.62f, 0.62f, 1.0f));
+	Top  = MakeVisual(this, Parent, TEXT("Top"),  Sph.Object, FVector(0.f, 0.f, 45.f), FVector(0.62f));
+	Feet = MakeVisual(this, Parent, TEXT("Feet"), Sph.Object, FVector(0.f, 0.f, -55.f), FVector(0.62f));
+	Head = MakeVisual(this, Parent, TEXT("Head"), Sph.Object, FVector(0.f, 0.f, 80.f), FVector(0.34f));
 	// Маркер над головой — виден только у игрока, которым управляет человек
-	Marker = MakeVisual(this, Parent, TEXT("Marker"), Cone.Object, FVector(0.f, 0.f, 150.f), FVector(0.4f),
+	Marker = MakeVisual(this, Parent, TEXT("Marker"), Cone.Object, FVector(0.f, 0.f, 140.f), FVector(0.3f),
 	                    FRotator(180.f, 0.f, 0.f));
 	Marker->SetCastShadow(false);
 	Marker->SetVisibility(false);
 }
 
-void ASoccerPlayer::Setup(int32 InTeam, bool bInGoalkeeper, const FVector& InHome)
+void ASoccerPlayer::Setup(int32 InTeam, bool bInGoalkeeper, const FVector& InHome, float InHomeYaw,
+                          const FSoccerPlayerInfo& InInfo, int32 InRosterIndex,
+                          const FLinearColor& Shirt, const FLinearColor& Shorts)
 {
 	Team = InTeam;
 	bGoalkeeper = bInGoalkeeper;
 	Home = InHome;
+	HomeYaw = InHomeYaw;
+	Info = InInfo;
+	RosterIndex = InRosterIndex;
+	ShirtColor = Shirt;
 
-	// Красные / синие; вратари — оранжевый и бирюзовый, чтобы их было видно
-	FLinearColor Color = Team == 0 ? FLinearColor(0.8f, 0.05f, 0.05f) : FLinearColor(0.05f, 0.15f, 0.85f);
-	if (bGoalkeeper)
-	{
-		Color = Team == 0 ? FLinearColor(1.f, 0.45f, 0.f) : FLinearColor(0.f, 0.75f, 0.75f);
-	}
-	Paint(Body, Color);
-	Paint(Head, Color);
-	Paint(Feet, Color);
-	Paint(Nose, FLinearColor(0.05f, 0.05f, 0.05f));
-	Paint(Marker, FLinearColor(1.f, 0.9f, 0.f));
+	static const FLinearColor Skins[3] = {
+		FLinearColor(0.8f, 0.55f, 0.4f), FLinearColor(0.55f, 0.35f, 0.22f), FLinearColor(0.9f, 0.7f, 0.55f)
+	};
+	Paint(Body, Shirt);
+	Paint(Top, Shirt);
+	Paint(Feet, Shorts);
+	Paint(Head, Skins[GetTypeHash(Info.Name) % 3]);
+	Paint(Marker, FLinearColor(0.35f, 1.f, 0.02f));
 
 	ResetToHome();
 }
@@ -389,7 +604,7 @@ void ASoccerPlayer::Setup(int32 InTeam, bool bInGoalkeeper, const FVector& InHom
 void ASoccerPlayer::ResetToHome()
 {
 	SetActorLocation(Home, false, nullptr, ETeleportType::TeleportPhysics);
-	SetActorRotation(FRotator(0.f, Team == 0 ? 0.f : 180.f, 0.f));
+	SetActorRotation(FRotator(0.f, HomeYaw, 0.f));
 	GetCharacterMovement()->StopMovementImmediately();
 	StunTime = TackleCooldown = SkillCooldown = ProtectTime = DashTime = 0.f;
 	AIDecisionTimer = 0.5f;
@@ -405,6 +620,12 @@ ASoccerGameMode* ASoccerPlayer::GM() const
 ASoccerPlayerController* ASoccerPlayer::HumanPC() const
 {
 	return Cast<ASoccerPlayerController>(GetWorld()->GetFirstPlayerController());
+}
+
+// Характеристика СКР: 50 -> 0.85, 99 -> 1.14 от базовой скорости
+float ASoccerPlayer::SpeedFactor() const
+{
+	return FMath::Clamp(0.85f + (Info.Pace - 50) * 0.006f, 0.8f, 1.15f);
 }
 
 bool ASoccerPlayer::HasBall() const
@@ -475,7 +696,7 @@ void ASoccerPlayer::Tick(float Dt)
 	ProtectTime    = FMath::Max(0.f, ProtectTime - Dt);
 	AIDecisionTimer -= Dt;
 
-	// После гола и после финального свистка все стоят
+	// В меню, после гола и после финального свистка все стоят
 	if (!G->IsPlayActive() || StunTime > 0.f)
 	{
 		return;
@@ -570,7 +791,7 @@ void ASoccerPlayer::MoveTo(const FVector& Target, float Speed)
 	FVector D = Target - GetActorLocation();
 	D.Z = 0.f;
 	const float Dist = D.Size();
-	GetCharacterMovement()->MaxWalkSpeed = Speed;
+	GetCharacterMovement()->MaxWalkSpeed = Speed * SpeedFactor();
 	if (Dist > 30.f)
 	{
 		// у цели сбавляем ход, чтобы не «дёргаться» вокруг точки
@@ -627,7 +848,7 @@ void ASoccerPlayer::TickHuman(float Dt)
 		bFaceBall = true;
 	}
 
-	GetCharacterMovement()->MaxWalkSpeed = Speed;
+	GetCharacterMovement()->MaxWalkSpeed = Speed * SpeedFactor();
 	GetCharacterMovement()->bOrientRotationToMovement = !bFaceBall;
 	if (bFaceBall)
 	{
@@ -739,14 +960,14 @@ void ASoccerPlayer::TickAIWithBall(float Dt)
 		}
 
 		// Соперник рядом — пытаемся отдать пас вперёд
-		float OppDist = 0.f;
-		NearestOpponent(OppDist);
-		if (OppDist < 200.f)
+		float PressDist = 0.f;
+		NearestOpponent(PressDist);
+		if (PressDist < 200.f)
 		{
 			AIDecisionTimer = 0.6f;
 			if (FindPassTarget(ToGoal) && FMath::FRand() < 0.6f)
 			{
-				Pass(EPassKind::Ground, ToGoal);
+				Pass(EPassKind::Ground, ToGoal, 0.5f);
 				return;
 			}
 		}
@@ -769,17 +990,21 @@ void ASoccerPlayer::TickAIWithBall(float Dt)
 // ---------------------------------------------------------------------------
 void ASoccerPlayer::TickGoalkeeper(float Dt)
 {
-	ASoccerBall* Ball = GM()->Ball;
+	ASoccerGameMode* G = GM();
+	ASoccerBall* Ball = G->Ball;
 	const FVector BallLoc = Ball->GetActorLocation();
 	const FVector Me = GetActorLocation();
 	const float Side = -AttackSign();          // с какой стороны наши ворота
 	const float GoalX = Side * HalfLength;
 
-	// Раз в 0.15 с пересчитываем, куда встать (задержка реакции — иначе вратарь непробиваем)
+	// Задержка реакции: у вратаря соперника зависит от сложности, у нашего — средняя
+	static const float Reactions[3] = { 0.25f, 0.15f, 0.1f };
+	const float Reaction = Team == HumanTeam ? 0.15f : Reactions[FMath::Clamp(G->GetDifficulty(), 0, 2)];
+
 	GKReactionTimer -= Dt;
 	if (GKReactionTimer <= 0.f)
 	{
-		GKReactionTimer = 0.15f;
+		GKReactionTimer = Reaction;
 		GKTargetY = BallLoc.Y * 0.5f;
 		// Мяч летит в сторону ворот — встаём в точку, где он пересечёт линию
 		if (Ball->Velocity.X * Side > 300.f)
@@ -852,14 +1077,17 @@ ASoccerPlayer* ASoccerPlayer::FindPassTarget(const FVector& AimDir) const
 	return Best;
 }
 
-void ASoccerPlayer::Pass(EPassKind Kind, const FVector& AimDir)
+FSoccerKick ASoccerPlayer::PlanPass(EPassKind Kind, const FVector& AimDir, float Power01) const
 {
-	if (!CanKickBall()) return;
-	ASoccerBall* Ball = GM()->Ball;
+	FSoccerKick Plan;
+	const ASoccerBall* Ball = GM()->Ball;
 	const FVector From = Ball->GetActorLocation();
 	const FVector Aim = AimDir.IsNearlyZero() ? GetActorForwardVector() : AimDir.GetSafeNormal2D();
+	const float Power = FMath::Clamp(Power01, 0.f, 1.f);
 
 	ASoccerPlayer* Mate = FindPassTarget(Aim);
+	Plan.Receiver = Mate;
+
 	FVector Target = From;
 	if (Mate)
 	{
@@ -875,8 +1103,9 @@ void ASoccerPlayer::Pass(EPassKind Kind, const FVector& AimDir)
 	}
 	else
 	{
-		// Партнёра по направлению нет — просто отдаём мяч в ту сторону
-		Target = From + Aim * (Kind == EPassKind::Lob ? 1500.f : 900.f);
+		// Партнёра по направлению нет — дальность паса задаёт сила замаха
+		const float Range = Kind == EPassKind::Lob ? FMath::Lerp(700.f, 2600.f, Power) : FMath::Lerp(400.f, 1800.f, Power);
+		Target = From + Aim * Range;
 	}
 	Target = ClampToField(Target, 100.f);
 
@@ -885,38 +1114,37 @@ void ASoccerPlayer::Pass(EPassKind Kind, const FVector& AimDir)
 	const float Dist = FMath::Max(1.f, (float)Flat.Size());
 	const FVector Dir = Flat / Dist;
 
-	FVector Vel;
 	if (Kind == EPassKind::Lob)
 	{
-		// Навес: время полёта T = 2*Vz/g, горизонтальная скорость = путь / T
-		const float Vz = FMath::Clamp(400.f + Dist * 0.25f, 500.f, 950.f);
+		// Навес: время полёта T = 2*Vz/g, горизонтальная скорость = дальность / T.
+		// Сила замаха удлиняет или укорачивает навес относительно партнёра.
+		const float Land = Mate ? Dist * FMath::Lerp(0.85f, 1.2f, Power) : Dist;
+		const float Vz = FMath::Clamp(400.f + Land * 0.25f, 500.f, 950.f);
 		const float T = 2.f * Vz / Ball->Gravity;
-		Vel = Dir * (Dist / T) + FVector(0.f, 0.f, Vz);
+		Plan.Velocity = Dir * (Land / T) + FVector(0.f, 0.f, Vz);
 	}
 	else
 	{
 		// Мяч по газону: с экспоненциальным трением путь = (v0 - v1) / k,
-		// значит v0 = путь * k + скорость_прихода.
+		// значит v0 = путь * k + скорость_прихода. Сила замаха: 0.8x..1.35x от идеала.
 		const float Arrive = Kind == EPassKind::Through ? 350.f : 450.f;
-		const float Speed = FMath::Clamp(Dist * Ball->RollingFriction + Arrive, 600.f, 2400.f);
-		Vel = Dir * Speed;
+		const float Speed = Mate ? (Dist * Ball->RollingFriction + Arrive) * FMath::Lerp(0.8f, 1.35f, Power)
+		                         : Dist * Ball->RollingFriction + 150.f;
+		Plan.Velocity = Dir * FMath::Clamp(Speed, 500.f, 2600.f);
 	}
-
-	SetActorRotation(FRotator(0.f, Dir.Rotation().Yaw, 0.f));
-	Ball->Kick(this, Vel);
-	Ball->IntendedReceiver = Mate; // ИИ-партнёр побежит принимать
+	return Plan;
 }
 
-void ASoccerPlayer::Shoot(const FVector& AimDir, float Power01, bool bFinesse)
+FSoccerKick ASoccerPlayer::PlanShot(const FVector& AimDir, float Power01, bool bFinesse, bool bWithError) const
 {
-	if (!CanKickBall()) return;
-	ASoccerBall* Ball = GM()->Ball;
+	FSoccerKick Plan;
+	const ASoccerBall* Ball = GM()->Ball;
 	const FVector From = Ball->GetActorLocation();
 	const float Power = FMath::Clamp(Power01, 0.f, 1.f);
 
 	// Куда в створ: поперечная составляющая стика выбирает угол ворот
 	float AimY = FMath::Clamp((float)AimDir.Y * 2.f, -1.f, 1.f) * GoalHalfWidth * 0.8f;
-	if (!bFinesse)
+	if (bWithError && !bFinesse)
 	{
 		AimY += FMath::FRandRange(-1.f, 1.f) * 50.f * Power; // сильный удар — менее точный
 	}
@@ -927,10 +1155,10 @@ void ASoccerPlayer::Shoot(const FVector& AimDir, float Power01, bool bFinesse)
 	const float Dist = FMath::Max(1.f, (float)Flat.Size());
 	FVector Dir = Flat / Dist;
 
-	float Speed = FMath::Lerp(1300.f, 3000.f, Power);
+	// Характеристика УДР: 50 -> 0.85, 99 -> 1.14 от базовой силы удара
+	const float ShotFactor = FMath::Clamp(0.85f + (Info.Shooting - 50) * 0.006f, 0.8f, 1.15f);
+	float Speed = FMath::Lerp(1300.f, 3000.f, Power) * ShotFactor;
 	float Lift = Power * 250.f + (Dist > 1500.f ? 150.f : 0.f);
-	FVector Curve = FVector::ZeroVector;
-	float CurveTime = 0.f;
 
 	if (bFinesse)
 	{
@@ -939,17 +1167,41 @@ void ASoccerPlayer::Shoot(const FVector& AimDir, float Power01, bool bFinesse)
 		// −v·sin(A)·T + c·T²/2 = 0  =>  c = 2·v·sin(A) / T   (приближённо, без учёта трения)
 		Speed *= 0.8f;
 		Lift = 120.f;
-		const float AngleDeg = 12.f;
+		const float Angle = FMath::DegreesToRadians(12.f);
 		const float T = Dist / Speed;
 		FVector Perp = FVector::CrossProduct(FVector::UpVector, Dir);
 		if (Perp.Y * AimY > 0.f) Perp = -Perp; // стартуем от центра ворот наружу
-		Dir = (Dir * FMath::Cos(FMath::DegreesToRadians(AngleDeg)) - Perp * FMath::Sin(FMath::DegreesToRadians(AngleDeg))).GetSafeNormal();
-		Curve = Perp * (2.f * Speed * FMath::Sin(FMath::DegreesToRadians(AngleDeg)) / T);
-		CurveTime = T;
+		Dir = (Dir * FMath::Cos(Angle) - Perp * FMath::Sin(Angle)).GetSafeNormal();
+		Plan.Curve = Perp * (2.f * Speed * FMath::Sin(Angle) / T);
+		Plan.CurveTime = T;
 	}
 
-	SetActorRotation(FRotator(0.f, Dir.Rotation().Yaw, 0.f));
-	Ball->Kick(this, Dir * Speed + FVector(0.f, 0.f, Lift), Curve, CurveTime);
+	Plan.Velocity = Dir * Speed + FVector(0.f, 0.f, Lift);
+	return Plan;
+}
+
+void ASoccerPlayer::ExecuteKick(const FSoccerKick& Plan)
+{
+	ASoccerBall* Ball = GM()->Ball;
+	SetActorRotation(FRotator(0.f, Plan.Velocity.GetSafeNormal2D().Rotation().Yaw, 0.f));
+	Ball->Kick(this, Plan.Velocity, Plan.Curve, Plan.CurveTime);
+	Ball->IntendedReceiver = Plan.Receiver; // ИИ-партнёр побежит принимать
+}
+
+void ASoccerPlayer::Pass(EPassKind Kind, const FVector& AimDir, float Power01)
+{
+	if (!CanKickBall()) return;
+	ExecuteKick(PlanPass(Kind, AimDir, Power01));
+	if (IsPlayerControlled())
+	{
+		GM()->OnHumanPass();
+	}
+}
+
+void ASoccerPlayer::Shoot(const FVector& AimDir, float Power01, bool bFinesse)
+{
+	if (!CanKickBall()) return;
+	ExecuteKick(PlanShot(AimDir, Power01, bFinesse, true));
 }
 
 void ASoccerPlayer::Tackle()
@@ -957,7 +1209,8 @@ void ASoccerPlayer::Tackle()
 	if (TackleCooldown > 0.f) return;
 	TackleCooldown = 0.8f;
 
-	ASoccerBall* Ball = GM()->Ball;
+	ASoccerGameMode* G = GM();
+	ASoccerBall* Ball = G->Ball;
 	ASoccerPlayer* Carrier = Ball->OwnerPlayer;
 	if (!Carrier || Carrier->Team == Team) return;
 
@@ -968,8 +1221,13 @@ void ASoccerPlayer::Tackle()
 		return;
 	}
 
-	// Шанс отбора: человеку проще, укрывание мяча и финт соперника его снижают
-	float Chance = IsPlayerControlled() ? 0.7f : 0.35f;
+	// Шанс отбора: человеку проще; у ИИ соперника зависит от сложности.
+	// ЗАЩ отбирающего повышает шанс, укрывание мяча, финт и ФИЗ владельца — снижают.
+	static const float AIChances[3] = { 0.25f, 0.35f, 0.45f };
+	float Chance = IsPlayerControlled() ? 0.7f
+	             : (Team == HumanTeam ? 0.35f : AIChances[FMath::Clamp(G->GetDifficulty(), 0, 2)]);
+	Chance *= Info.Defending / 75.f;
+	Chance *= FMath::Clamp(1.4f - Carrier->Info.Physical / 150.f, 0.6f, 1.2f);
 	if (Carrier->IsShielding()) Chance *= 0.45f;
 	if (Carrier->ProtectTime > 0.f) Chance *= 0.2f;
 
@@ -998,8 +1256,9 @@ void ASoccerPlayer::SkillMove(const FVector& Dir, bool bBig)
 {
 	if (!HasBall() || SkillCooldown > 0.f) return;
 	// Финт: резкий уход с мячом в сторону щелчка правого стика.
-	// С RB — более длинный финт и более долгая защита от отбора.
-	SkillCooldown = bBig ? 0.9f : 0.5f;
+	// С RB — более длинный финт и более долгая защита от отбора. ДРБ сокращает перезарядку.
+	const float DribbleFactor = FMath::Clamp(1.2f - Info.Dribbling / 250.f, 0.8f, 1.f);
+	SkillCooldown = (bBig ? 0.9f : 0.5f) * DribbleFactor;
 	ProtectTime   = bBig ? 0.5f : 0.25f;
 	StartDash(Dir, bBig ? 1000.f : 750.f, bBig ? 0.3f : 0.2f, false);
 }
@@ -1051,17 +1310,17 @@ void ASoccerPlayerController::SetupInputComponent()
 
 	Context = NewObject<UInputMappingContext>(this);
 
-	UInputAction* IA_Move    = NewAction(2);
-	UInputAction* IA_Right   = NewAction(2);
-	UInputAction* IA_Sprint  = NewAction(1);
-	UInputAction* IA_LT      = NewAction(1);
-	UInputAction* IA_RB      = NewAction(0);
-	UInputAction* IA_A       = NewAction(0);
-	UInputAction* IA_B       = NewAction(0);
-	UInputAction* IA_X       = NewAction(0);
-	UInputAction* IA_Y       = NewAction(0);
-	UInputAction* IA_LB      = NewAction(0);
-	UInputAction* IA_Restart = NewAction(0);
+	UInputAction* IA_Move   = NewAction(2);
+	UInputAction* IA_Right  = NewAction(2);
+	UInputAction* IA_Sprint = NewAction(1);
+	UInputAction* IA_LT     = NewAction(1);
+	UInputAction* IA_RB     = NewAction(0);
+	UInputAction* IA_A      = NewAction(0);
+	UInputAction* IA_B      = NewAction(0);
+	UInputAction* IA_X      = NewAction(0);
+	UInputAction* IA_Y      = NewAction(0);
+	UInputAction* IA_LB     = NewAction(0);
+	UInputAction* IA_Start  = NewAction(0);
 
 	// --- Левый стик / WASD: движение ---
 	Map(IA_Move, EKeys::Gamepad_Left2D, false, false, true);
@@ -1087,7 +1346,7 @@ void ASoccerPlayerController::SetupInputComponent()
 	Map(IA_LB, EKeys::Gamepad_LeftShoulder);         // LB / L1 — смена игрока
 	Map(IA_LB, EKeys::Tab);
 
-	// --- Кнопки (Xbox A/B/X/Y = PlayStation ✖/⭕/⬛/▲) ---
+	// --- Кнопки (Xbox A/B/X/Y = PlayStation ✖/⭕/⬛/▲). Зажать — сила, отпустить — удар/пас ---
 	Map(IA_A, EKeys::Gamepad_FaceButton_Bottom);     // A ✖ — пас / сдерживание
 	Map(IA_A, EKeys::SpaceBar);
 	Map(IA_B, EKeys::Gamepad_FaceButton_Right);      // B ⭕ — удар / отбор
@@ -1096,8 +1355,9 @@ void ASoccerPlayerController::SetupInputComponent()
 	Map(IA_X, EKeys::Q);
 	Map(IA_Y, EKeys::Gamepad_FaceButton_Top);        // Y ▲ — пас в разрез / выход вратаря
 	Map(IA_Y, EKeys::E);
-	Map(IA_Restart, EKeys::Gamepad_Special_Right);   // Start / Options — новый матч
-	Map(IA_Restart, EKeys::Enter);
+	Map(IA_Start, EKeys::Gamepad_Special_Right);     // Start / Options — пауза
+	Map(IA_Start, EKeys::P);
+	Map(IA_Start, EKeys::Enter);
 
 	UEnhancedInputComponent* EIC = Cast<UEnhancedInputComponent>(InputComponent);
 	if (!EIC)
@@ -1121,10 +1381,11 @@ void ASoccerPlayerController::SetupInputComponent()
 	EIC->BindAction(IA_B,      ETriggerEvent::Started,   this, &ASoccerPlayerController::OnB);
 	EIC->BindAction(IA_B,      ETriggerEvent::Completed, this, &ASoccerPlayerController::OnBStop);
 	EIC->BindAction(IA_X,      ETriggerEvent::Started,   this, &ASoccerPlayerController::OnX);
+	EIC->BindAction(IA_X,      ETriggerEvent::Completed, this, &ASoccerPlayerController::OnXStop);
 	EIC->BindAction(IA_Y,      ETriggerEvent::Started,   this, &ASoccerPlayerController::OnY);
 	EIC->BindAction(IA_Y,      ETriggerEvent::Completed, this, &ASoccerPlayerController::OnYStop);
 	EIC->BindAction(IA_LB,     ETriggerEvent::Started,   this, &ASoccerPlayerController::OnLB);
-	EIC->BindAction(IA_Restart,ETriggerEvent::Started,   this, &ASoccerPlayerController::OnRestart);
+	EIC->BindAction(IA_Start,  ETriggerEvent::Started,   this, &ASoccerPlayerController::OnStart);
 }
 
 void ASoccerPlayerController::BeginPlay()
@@ -1143,26 +1404,45 @@ void ASoccerPlayerController::BeginPlay()
 void ASoccerPlayerController::PlayerTick(float DeltaTime)
 {
 	Super::PlayerTick(DeltaTime);
-	// Мяч потеряли во время замаха — удар отменяется
+	// Мяч потеряли во время замаха — удар/пас отменяется
 	const ASoccerPlayer* P = Current();
-	if (ChargeStart >= 0.f && (!P || !P->HasBall()))
+	if (Charging != ECharge::None && (!P || !P->HasBall()))
 	{
-		ChargeStart = -1.f;
+		Charging = ECharge::None;
 	}
+	UpdateAimPreview();
+}
+
+ASoccerGameMode* ASoccerPlayerController::GM() const
+{
+	return GetWorld()->GetAuthGameMode<ASoccerGameMode>();
 }
 
 ASoccerPlayer* ASoccerPlayerController::Current() const
 {
-	// Пока мяч не в игре (гол / конец матча) — кнопки действий не работают
-	const ASoccerGameMode* G = GetWorld()->GetAuthGameMode<ASoccerGameMode>();
+	// Пока мяч не в игре (меню / гол / конец матча) — кнопки действий не работают
+	const ASoccerGameMode* G = GM();
 	if (!G || !G->IsPlayActive()) return nullptr;
 	return Cast<ASoccerPlayer>(GetPawn());
+}
+
+void ASoccerPlayerController::ResetInputState()
+{
+	MoveInput = RightInput = FVector2D::ZeroVector;
+	SprintAxis = LTAxis = 0.f;
+	bRBHeld = bContainHeld = bGKRushHeld = false;
+	Charging = ECharge::None;
+	bRightStickArmed = true;
+	if (ASoccerGameMode* G = GM())
+	{
+		if (G->AimLine) G->AimLine->HidePath();
+	}
 }
 
 FVector ASoccerPlayerController::StickToWorld(const FVector2D& Stick) const
 {
 	// Вверх по стику = «от камеры», вправо = вправо по экрану
-	const ASoccerGameMode* G = GetWorld()->GetAuthGameMode<ASoccerGameMode>();
+	const ASoccerGameMode* G = GM();
 	const float Yaw = G ? G->GetCameraYaw() : 0.f;
 	const FVector Forward = FRotator(0.f, Yaw, 0.f).Vector();
 	const FVector Right = FRotator(0.f, Yaw + 90.f, 0.f).Vector();
@@ -1173,15 +1453,68 @@ FVector ASoccerPlayerController::AimDirection() const
 {
 	const FVector Dir = StickToWorld(MoveInput);
 	if (Dir.Size() > 0.2f) return Dir.GetSafeNormal2D();
-	const ASoccerPlayer* P = Current();
+	const APawn* P = GetPawn();
 	return P ? P->GetActorForwardVector() : FVector::ForwardVector;
 }
 
-float ASoccerPlayerController::GetShotCharge() const
+float ASoccerPlayerController::GetCharge() const
 {
-	if (ChargeStart < 0.f) return -1.f;
-	// Полный заряд — за 1 секунду удержания
-	return FMath::Clamp<float>(GetWorld()->GetTimeSeconds() - ChargeStart, 0.2f, 1.f);
+	if (Charging == ECharge::None) return -1.f;
+	// Полная сила — за 1 секунду удержания
+	return FMath::Clamp<float>(GetWorld()->GetTimeSeconds() - ChargeStart, 0.f, 1.f);
+}
+
+void ASoccerPlayerController::BeginCharge(ECharge Kind)
+{
+	if (Charging != ECharge::None) return; // одновременно заряжается только одно действие
+	Charging = Kind;
+	ChargeStart = GetWorld()->GetTimeSeconds();
+}
+
+void ASoccerPlayerController::ReleaseCharge(ECharge Kind)
+{
+	if (Charging != Kind) return;
+	const float Power = GetCharge();
+	Charging = ECharge::None;
+
+	ASoccerPlayer* P = Current();
+	if (!P || !P->CanKickBall()) return;
+	switch (Kind)
+	{
+	case ECharge::Pass:    P->Pass(EPassKind::Ground, AimDirection(), Power); break;
+	case ECharge::Through: P->Pass(EPassKind::Through, AimDirection(), Power); break;
+	case ECharge::Lob:     P->Pass(EPassKind::Lob, AimDirection(), Power); break;
+	case ECharge::Shot:    P->Shoot(AimDirection(), FMath::Max(0.15f, Power), bRBHeld); break;
+	default: break;
+	}
+}
+
+// Белая линия: пока кнопка зажата, показываем, куда пойдёт мяч при текущих прицеле и силе
+void ASoccerPlayerController::UpdateAimPreview()
+{
+	ASoccerGameMode* G = GM();
+	if (!G || !G->AimLine || !G->Ball) return;
+
+	const ASoccerPlayer* P = Current();
+	if (Charging == ECharge::None || !P)
+	{
+		G->AimLine->HidePath();
+		return;
+	}
+
+	const float Power = GetCharge();
+	FSoccerKick Plan;
+	switch (Charging)
+	{
+	case ECharge::Pass:    Plan = P->PlanPass(EPassKind::Ground, AimDirection(), Power); break;
+	case ECharge::Through: Plan = P->PlanPass(EPassKind::Through, AimDirection(), Power); break;
+	case ECharge::Lob:     Plan = P->PlanPass(EPassKind::Lob, AimDirection(), Power); break;
+	default:               Plan = P->PlanShot(AimDirection(), FMath::Max(0.15f, Power), bRBHeld, false); break;
+	}
+
+	TArray<FVector> Path;
+	G->Ball->PredictPath(G->Ball->GetActorLocation(), Plan.Velocity, Plan.Curve, Plan.CurveTime, Path);
+	G->AimLine->ShowPath(Path);
 }
 
 void ASoccerPlayerController::PossessPlayer(ASoccerPlayer* NewPlayer)
@@ -1201,13 +1534,13 @@ void ASoccerPlayerController::PossessPlayer(ASoccerPlayer* NewPlayer)
 	{
 		Old->SpawnDefaultController();
 	}
-	ChargeStart = -1.f;
+	Charging = ECharge::None;
 	bContainHeld = false;
 }
 
 void ASoccerPlayerController::SwitchPlayer(const FVector& Dir)
 {
-	const ASoccerGameMode* G = GetWorld()->GetAuthGameMode<ASoccerGameMode>();
+	const ASoccerGameMode* G = GM();
 	ASoccerPlayer* Cur = Current();
 	if (!G || !G->Ball || !Cur) return;
 
@@ -1282,73 +1615,102 @@ void ASoccerPlayerController::OnRightStop()
 	bRightStickArmed = true;
 }
 
-// --- A / ✖: пас низом (или головой) | в обороне — сдерживание (удержание) ---
+// --- A / ✖: пас низом (зажать — сила) | мяч рядом — пас в касание/головой | в обороне — сдерживание ---
 void ASoccerPlayerController::OnA()
 {
 	ASoccerPlayer* P = Current();
 	if (!P) return;
-	if (P->CanKickBall()) P->Pass(EPassKind::Ground, AimDirection());
-	else                  bContainHeld = true;
+	if (P->HasBall())          BeginCharge(ECharge::Pass);
+	else if (P->CanKickBall()) P->Pass(EPassKind::Ground, AimDirection(), 0.5f);
+	else                       bContainHeld = true;
 }
-void ASoccerPlayerController::OnAStop() { bContainHeld = false; }
+void ASoccerPlayerController::OnAStop()
+{
+	bContainHeld = false;
+	ReleaseCharge(ECharge::Pass);
+}
 
-// --- B / ⭕: удар (зажать — сила, отпустить — удар; с RB — изящный) | в обороне — отбор/толчок ---
+// --- B / ⭕: удар (зажать — сила; с RB — изящный) | мяч рядом — с лёта/головой | в обороне — отбор ---
 void ASoccerPlayerController::OnB()
 {
 	ASoccerPlayer* P = Current();
 	if (!P) return;
-	if (P->HasBall())
-	{
-		ChargeStart = GetWorld()->GetTimeSeconds(); // начинаем замах
-	}
-	else if (P->CanKickBall())
-	{
-		P->Shoot(AimDirection(), 0.8f, bRBHeld);    // мяч рядом/в воздухе: удар с лёта или головой
-	}
-	else
-	{
-		P->Tackle();
-	}
+	if (P->HasBall())          BeginCharge(ECharge::Shot);
+	else if (P->CanKickBall()) P->Shoot(AimDirection(), 0.8f, bRBHeld);
+	else                       P->Tackle();
 }
-void ASoccerPlayerController::OnBStop()
-{
-	ASoccerPlayer* P = Current();
-	if (P && ChargeStart >= 0.f)
-	{
-		P->Shoot(AimDirection(), GetShotCharge(), bRBHeld);
-	}
-	ChargeStart = -1.f;
-}
+void ASoccerPlayerController::OnBStop() { ReleaseCharge(ECharge::Shot); }
 
-// --- X / ⬛: навес / длинный пас | в обороне — подкат ---
+// --- X / ⬛: навес / длинный пас (зажать — сила) | в обороне — подкат ---
 void ASoccerPlayerController::OnX()
 {
 	ASoccerPlayer* P = Current();
 	if (!P) return;
-	if (P->CanKickBall()) P->Pass(EPassKind::Lob, AimDirection());
-	else                  P->SlideTackle(AimDirection());
+	if (P->HasBall())          BeginCharge(ECharge::Lob);
+	else if (P->CanKickBall()) P->Pass(EPassKind::Lob, AimDirection(), 0.5f);
+	else                       P->SlideTackle(AimDirection());
 }
+void ASoccerPlayerController::OnXStop() { ReleaseCharge(ECharge::Lob); }
 
-// --- Y / ▲: пас в разрез | в обороне удержание — выход вратаря ---
+// --- Y / ▲: пас в разрез (зажать — сила) | в обороне удержание — выход вратаря ---
 void ASoccerPlayerController::OnY()
 {
 	ASoccerPlayer* P = Current();
 	if (!P) return;
-	if (P->CanKickBall()) P->Pass(EPassKind::Through, AimDirection());
-	else                  bGKRushHeld = true;
+	if (P->HasBall())          BeginCharge(ECharge::Through);
+	else if (P->CanKickBall()) P->Pass(EPassKind::Through, AimDirection(), 0.5f);
+	else                       bGKRushHeld = true;
 }
-void ASoccerPlayerController::OnYStop() { bGKRushHeld = false; }
+void ASoccerPlayerController::OnYStop()
+{
+	bGKRushHeld = false;
+	ReleaseCharge(ECharge::Through);
+}
 
 // --- LB / L1: переключиться на игрока, ближайшего к мячу ---
 void ASoccerPlayerController::OnLB() { SwitchPlayer(FVector::ZeroVector); }
 
-// --- Start / Options: новый матч ---
-void ASoccerPlayerController::OnRestart()
+// --- Start / Options: пауза ---
+void ASoccerPlayerController::OnStart()
 {
-	if (ASoccerGameMode* G = GetWorld()->GetAuthGameMode<ASoccerGameMode>())
+	if (ASoccerGameMode* G = GM())
 	{
-		G->RestartMatch();
+		G->TogglePause();
 	}
+}
+
+// ============================================================================
+//  HUD: шкала силы под игроком, пока зажата кнопка удара/паса
+// ============================================================================
+
+void ASoccerHUD::DrawHUD()
+{
+	Super::DrawHUD();
+
+	const ASoccerPlayerController* PC = Cast<ASoccerPlayerController>(GetOwningPlayerController());
+	if (!PC || !Canvas) return;
+	const float Charge = PC->GetCharge();
+	const APawn* P = PC->GetPawn();
+	if (Charge < 0.f || !P) return;
+
+	// Точка под ногами игрока на экране
+	const FVector S = Project(P->GetActorLocation() - FVector(0.f, 0.f, 95.f));
+	if (S.Z <= 0.f) return;
+
+	const float K = Canvas->ClipY / 1080.f;
+	const float W = 120.f * K;
+	const float H = 12.f * K;
+	const float X = S.X - W * 0.5f;
+	const float Y = S.Y + 12.f * K;
+
+	// Цвет заполнения: зелёный -> жёлтый -> красный
+	const FLinearColor Green(0.3f, 1.f, 0.02f), Yellow(1.f, 0.85f, 0.f), Red(1.f, 0.1f, 0.02f);
+	const FLinearColor Fill = Charge < 0.5f ? FMath::Lerp(Green, Yellow, Charge * 2.f)
+	                                        : FMath::Lerp(Yellow, Red, (Charge - 0.5f) * 2.f);
+
+	DrawRect(FLinearColor(1.f, 1.f, 1.f, 0.9f), X - 2.f * K, Y - 2.f * K, W + 4.f * K, H + 4.f * K);
+	DrawRect(FLinearColor(0.02f, 0.02f, 0.02f, 0.9f), X, Y, W, H);
+	DrawRect(Fill, X, Y, W * Charge, H);
 }
 
 // ============================================================================
@@ -1359,6 +1721,7 @@ ASoccerGameMode::ASoccerGameMode()
 {
 	PrimaryActorTick.bCanEverTick = true;
 	PlayerControllerClass = ASoccerPlayerController::StaticClass();
+	HUDClass = ASoccerHUD::StaticClass();
 	DefaultPawnClass = nullptr; // пешек спавним сами
 
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> Cube(MESH_CUBE);
@@ -1369,34 +1732,393 @@ void ASoccerGameMode::BeginPlay()
 {
 	Super::BeginPlay();
 
+	LoadProgress();
 	EnsureLighting();
 	BuildField();
 
 	Ball = GetWorld()->SpawnActor<ASoccerBall>(FVector(0.f, 0.f, BallRadius), FRotator::ZeroRotator);
-
-	SpawnTeams();
+	AimLine = GetWorld()->SpawnActor<ASoccerAimLine>(FVector::ZeroVector, FRotator::ZeroRotator);
 
 	Camera = GetWorld()->SpawnActor<ACameraActor>(FVector::ZeroVector, FRotator::ZeroRotator);
-	Camera->GetCameraComponent()->SetFieldOfView(CameraFOV);
 	Camera->GetCameraComponent()->bConstrainAspectRatio = false;
-	UpdateCamera(1.f);
 
+	// Игра начинается с главного меню
+	ReturnToMenu();
+}
+
+void ASoccerGameMode::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	HideWidget(PauseWidget);
+	HideWidget(HudWidget);
+	HideWidget(MenuWidget);
+	Super::EndPlay(EndPlayReason);
+}
+
+// Вызывается движком для нового игрока. Пешку по умолчанию не спавним.
+void ASoccerGameMode::RestartPlayer(AController* NewPlayer)
+{
+	if (bInMatch)
+	{
+		PossessHuman();
+	}
+}
+
+// ---------------------------------------------------------------------------
+//  Сохранения
+// ---------------------------------------------------------------------------
+void ASoccerGameMode::LoadProgress()
+{
+	if (UGameplayStatics::DoesSaveGameExist(SaveSlot, 0))
+	{
+		Save = Cast<USoccerSave>(UGameplayStatics::LoadGameFromSlot(SaveSlot, 0));
+	}
+	if (!Save)
+	{
+		Save = Cast<USoccerSave>(UGameplayStatics::CreateSaveGameObject(USoccerSave::StaticClass()));
+	}
+
+	// Заполняем значения по умолчанию и чиним «битые» сохранения
+	if (Save->Squad.Num() != 5)     Save->Squad = DefaultSquad();
+	if (Save->ClubName.IsEmpty())   Save->ClubName = GetClubNames()[0];
+	Save->OwnedKits.SetNum(GetSoccerKits().Num());
+	Save->OwnedKits[0] = true;
+	Save->PracticeDone.SetNum(NumPractice);
+	Save->ClaimedChallenges.SetNum(8);
+	Save->KitIndex = FMath::Clamp(Save->KitIndex, 0, GetSoccerKits().Num() - 1);
+	if (!Save->OwnedKits[Save->KitIndex]) Save->KitIndex = 0;
+	Save->StarterIndex = FMath::Clamp(Save->StarterIndex, 1, 4);
+	Save->MatchMinutes = FMath::Clamp(Save->MatchMinutes, 1, 3);
+	Save->Difficulty = FMath::Clamp(Save->Difficulty, 0, 2);
+}
+
+void ASoccerGameMode::SaveProgress()
+{
+	if (Save)
+	{
+		UGameplayStatics::SaveGameToSlot(Save, SaveSlot, 0);
+	}
+}
+
+void ASoccerGameMode::ResetProgress()
+{
+	UGameplayStatics::DeleteGameInSlot(SaveSlot, 0);
+	Save = nullptr;
+	LoadProgress();
+	SaveProgress();
+	RefreshLineup();
+}
+
+FSoccerPlayerInfo ASoccerGameMode::MakeRandomPlayer(const FString& Position, int32 BaseRating)
+{
+	// Случайный футболист: база ± разброс, с уклоном под позицию
+	auto Roll = [BaseRating](int32 Bias) { return FMath::Clamp(BaseRating + Bias + FMath::RandRange(-7, 7), 35, 99); };
+	const TArray<FString>& Pool = SurnamePool();
+	FSoccerPlayerInfo I;
+	I.Name = Pool[FMath::RandRange(0, Pool.Num() - 1)];
+	I.Position = Position;
+	if (Position == TEXT("ВР"))
+	{
+		I.Pace = Roll(-10); I.Shooting = Roll(-30); I.Passing = Roll(-10); I.Dribbling = Roll(-25); I.Defending = Roll(8); I.Physical = Roll(5);
+	}
+	else if (Position == TEXT("ЗЩ"))
+	{
+		I.Pace = Roll(0); I.Shooting = Roll(-15); I.Passing = Roll(-5); I.Dribbling = Roll(-10); I.Defending = Roll(8); I.Physical = Roll(6);
+	}
+	else
+	{
+		I.Pace = Roll(6); I.Shooting = Roll(5); I.Passing = Roll(0); I.Dribbling = Roll(5); I.Defending = Roll(-25); I.Physical = Roll(-5);
+	}
+	return I;
+}
+
+// ---------------------------------------------------------------------------
+//  Интерфейс: показать/спрятать Slate-виджет, режимы ввода
+// ---------------------------------------------------------------------------
+void ASoccerGameMode::ShowWidget(TSharedPtr<SWidget>& Holder, const TSharedRef<SWidget>& Widget, int32 ZOrder)
+{
+	HideWidget(Holder);
+	if (UGameViewportClient* Viewport = GetWorld()->GetGameViewport())
+	{
+		Viewport->AddViewportWidgetContent(Widget, ZOrder);
+		Holder = Widget;
+	}
+}
+
+void ASoccerGameMode::HideWidget(TSharedPtr<SWidget>& Holder)
+{
+	if (!Holder.IsValid()) return;
+	if (UWorld* World = GetWorld())
+	{
+		if (UGameViewportClient* Viewport = World->GetGameViewport())
+		{
+			Viewport->RemoveViewportWidgetContent(Holder.ToSharedRef());
+		}
+	}
+	Holder.Reset();
+}
+
+void ASoccerGameMode::SetUIInput(const TSharedPtr<SWidget>& Focus)
+{
+	APlayerController* PC = GetWorld()->GetFirstPlayerController();
+	if (!PC) return;
+	if (ASoccerPlayerController* SPC = Cast<ASoccerPlayerController>(PC)) SPC->ResetInputState();
+	FInputModeUIOnly Mode;
+	if (Focus.IsValid()) Mode.SetWidgetToFocus(Focus);
+	Mode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+	PC->SetInputMode(Mode);
+	PC->bShowMouseCursor = true;
+}
+
+void ASoccerGameMode::SetGameInput()
+{
+	APlayerController* PC = GetWorld()->GetFirstPlayerController();
+	if (!PC) return;
+	if (ASoccerPlayerController* SPC = Cast<ASoccerPlayerController>(PC)) SPC->ResetInputState();
+	PC->SetInputMode(FInputModeGameOnly());
+	PC->bShowMouseCursor = false;
+}
+
+// ---------------------------------------------------------------------------
+//  Меню ↔ матч
+// ---------------------------------------------------------------------------
+void ASoccerGameMode::ReturnToMenu()
+{
+	GetWorldTimerManager().ClearTimer(ResetTimer);
+	GetWorldTimerManager().ClearTimer(MenuTimer);
+	if (UGameplayStatics::IsGamePaused(this))
+	{
+		UGameplayStatics::SetGamePaused(this, false);
+	}
+	HideWidget(PauseWidget);
+	HideWidget(HudWidget);
+
+	bInMatch = false;
+	bPlayActive = false;
+	bMatchOver = false;
+	if (AimLine) AimLine->HidePath();
+
+	SpawnLineup();
+
+	if (APlayerController* PC = GetWorld()->GetFirstPlayerController())
+	{
+		PC->SetViewTarget(Camera);
+	}
+	UpdateCamera(0.f);
+
+	TSharedPtr<SWidget> Focus;
+	const TSharedRef<SWidget> Menu = SoccerUI::MakeMenu(this, Focus);
+	ShowWidget(MenuWidget, Menu, 10);
+	SetUIInput(Focus);
+}
+
+void ASoccerGameMode::StartMatch(ESoccerMode InMode, const FString& RivalName, int32 RivalDifficulty)
+{
+	GetWorldTimerManager().ClearTimer(ResetTimer);
+	GetWorldTimerManager().ClearTimer(MenuTimer);
+	if (UGameplayStatics::IsGamePaused(this))
+	{
+		UGameplayStatics::SetGamePaused(this, false);
+	}
+	HideWidget(MenuWidget);
+	HideWidget(PauseWidget);
+
+	MatchMode = InMode;
+	MatchDifficulty = RivalDifficulty >= 0 ? FMath::Clamp(RivalDifficulty, 0, 2) : Save->Difficulty;
+	if (IsPractice())
+	{
+		AwayName = TEXT("Спарринг");
+	}
+	else if (!RivalName.IsEmpty())
+	{
+		AwayName = RivalName;
+	}
+	else
+	{
+		const TArray<FString>& Rivals = RivalClubNames();
+		AwayName = Rivals[FMath::RandRange(0, Rivals.Num() - 1)];
+	}
+
+	// Состав соперника: рейтинг зависит от сложности
+	static const int32 BaseRating[3] = { 58, 68, 78 };
+	const int32 Base = BaseRating[MatchDifficulty];
+	AwaySquad = {
+		MakeRandomPlayer(TEXT("ВР"), Base), MakeRandomPlayer(TEXT("ЗЩ"), Base), MakeRandomPlayer(TEXT("ЗЩ"), Base),
+		MakeRandomPlayer(TEXT("НП"), Base), MakeRandomPlayer(TEXT("НП"), Base)
+	};
+
+	Score[0] = Score[1] = 0;
+	TimeLeft = IsPractice() ? 60.f : Save->MatchMinutes * 60.f;
+	GoalBanner = 0.f;
+	ResultText = FText::GetEmpty();
+	bMatchOver = false;
+	bInMatch = true;
+
+	SpawnTeams();
+	ResetPositions();
+	CamFocus = FVector::ZeroVector;
+
+	ShowWidget(HudWidget, SoccerUI::MakeHud(this), 5);
+	SetGameInput();
 	PossessHuman();
 }
 
-// Вызывается движком для нового игрока. Пешку по умолчанию не спавним — берём красного нападающего.
-void ASoccerGameMode::RestartPlayer(AController* NewPlayer)
+void ASoccerGameMode::RestartMatch()
 {
-	PossessHuman();
+	StartMatch(MatchMode, AwayName, MatchDifficulty);
+}
+
+void ASoccerGameMode::TogglePause()
+{
+	if (!bInMatch || bMatchOver) return;
+
+	const bool bPause = !UGameplayStatics::IsGamePaused(this);
+	UGameplayStatics::SetGamePaused(this, bPause);
+	if (bPause)
+	{
+		TSharedPtr<SWidget> Focus;
+		const TSharedRef<SWidget> Pause = SoccerUI::MakePause(this, Focus);
+		ShowWidget(PauseWidget, Pause, 20);
+		SetUIInput(Focus);
+	}
+	else
+	{
+		HideWidget(PauseWidget);
+		SetGameInput();
+	}
+}
+
+void ASoccerGameMode::QuitGame()
+{
+	UKismetSystemLibrary::QuitGame(this, GetWorld()->GetFirstPlayerController(), EQuitPreference::Quit, false);
+}
+
+// ---------------------------------------------------------------------------
+//  Спавн игроков
+// ---------------------------------------------------------------------------
+void ASoccerGameMode::DestroyPlayers()
+{
+	APlayerController* PC = GetWorld()->GetFirstPlayerController();
+	if (PC && PC->GetPawn())
+	{
+		PC->UnPossess();
+	}
+	for (ASoccerPlayer* P : Players)
+	{
+		if (P) P->Destroy();
+	}
+	Players.Reset();
+}
+
+ASoccerPlayer* ASoccerGameMode::SpawnPlayer(int32 InTeam, int32 RosterIdx, const FSoccerPlayerInfo& PlayerInfo,
+                                            const FVector& Location, float Yaw)
+{
+	FActorSpawnParameters Params;
+	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+	ASoccerPlayer* P = GetWorld()->SpawnActor<ASoccerPlayer>(Location, FRotator(0.f, Yaw, 0.f), Params);
+	if (!P) return nullptr;
+
+	// Форма: наша — из магазина/клуба, соперник — синий. Вратари выделяются цветом.
+	const bool bGK = RosterIdx == 0;
+	FLinearColor Shirt, Shorts;
+	if (InTeam == HumanTeam)
+	{
+		const FSoccerKit& Kit = GetSoccerKits()[Save->KitIndex];
+		Shirt = bGK ? FLinearColor(0.95f, 0.7f, 0.02f) : Kit.Shirt;
+		Shorts = bGK ? FLinearColor(0.05f, 0.05f, 0.05f) : Kit.Shorts;
+	}
+	else
+	{
+		Shirt = bGK ? FLinearColor(0.02f, 0.6f, 0.5f) : FLinearColor(0.03f, 0.12f, 0.6f);
+		Shorts = FLinearColor(0.9f, 0.9f, 0.9f);
+	}
+	P->Setup(InTeam, bGK, Location, Yaw, PlayerInfo, RosterIdx, Shirt, Shorts);
+	Players.Add(P);
+	return P;
+}
+
+void ASoccerGameMode::SpawnTeams()
+{
+	DestroyPlayers();
+
+	// Расстановка 1-2-2 для команды 0 (соперник — зеркально по X).
+	// Индекс 0 — вратарь, 1–2 — защитники, 3–4 — нападающие.
+	const FVector2D Layout[5] = {
+		FVector2D(-HalfLength + 70.f, 0.f),
+		FVector2D(-1150.f, -450.f),
+		FVector2D(-1150.f,  450.f),
+		FVector2D(-450.f,  -350.f),
+		FVector2D(-450.f,   350.f),
+	};
+	const float SpawnZ = 92.f; // полувысота капсулы + зазор
+
+	// Кто выходит на поле в каждом режиме
+	TArray<int32> Home, Away;
+	switch (MatchMode)
+	{
+	case ESoccerMode::PracticeShooting: Home = { Save->StarterIndex }; Away = { 0 };    break;
+	case ESoccerMode::PracticeOneOnOne: Home = { Save->StarterIndex }; Away = { 0, 1 }; break;
+	case ESoccerMode::PracticeAttack:   Home = { 0, 1, 2, 3, 4 };      Away = { 0, 1 }; break;
+	default:                            Home = { 0, 1, 2, 3, 4 };      Away = { 0, 1, 2, 3, 4 }; break;
+	}
+
+	for (int32 Idx : Home)
+	{
+		SpawnPlayer(0, Idx, Save->Squad[Idx], FVector(Layout[Idx].X, Layout[Idx].Y, SpawnZ), 0.f);
+	}
+	for (int32 Idx : Away)
+	{
+		SpawnPlayer(1, Idx, AwaySquad[Idx], FVector(-Layout[Idx].X, Layout[Idx].Y, SpawnZ), 180.f);
+	}
+}
+
+// Состав в меню: капитан в центре, остальные «клином» позади — как на командном фото
+void ASoccerGameMode::SpawnLineup()
+{
+	DestroyPlayers();
+	const int32 Starter = Save->StarterIndex;
+	const FVector Spots[5] = {
+		FVector(380.f, 0.f, 92.f), FVector(240.f, -260.f, 92.f), FVector(520.f, -260.f, 92.f),
+		FVector(130.f, -480.f, 92.f), FVector(630.f, -480.f, 92.f)
+	};
+	int32 Spot = 1;
+	for (int32 i = 0; i < 5; ++i)
+	{
+		const FVector Loc = i == Starter ? Spots[0] : Spots[Spot++];
+		SpawnPlayer(0, i, Save->Squad[i], Loc, 90.f); // лицом к камере
+	}
+	if (Ball)
+	{
+		Ball->ResetBall(FVector(420.f, 90.f, BallRadius));
+	}
+}
+
+void ASoccerGameMode::RefreshLineup()
+{
+	if (!bInMatch)
+	{
+		SpawnLineup();
+	}
 }
 
 void ASoccerGameMode::PossessHuman()
 {
 	ASoccerPlayerController* PC = Cast<ASoccerPlayerController>(GetWorld()->GetFirstPlayerController());
-	if (!PC || Players.Num() < 4 || !Camera) return; // поле ещё не построено — повторим из BeginPlay
-	PC->PossessPlayer(Players[3]);
+	if (!PC || !Camera) return;
+
+	// Стартовый игрок из состава, иначе — любой полевой нашей команды
+	ASoccerPlayer* Target = nullptr;
+	for (ASoccerPlayer* P : Players)
+	{
+		if (P->Team != HumanTeam || P->bGoalkeeper) continue;
+		if (!Target || P->RosterIndex == Save->StarterIndex) Target = P;
+	}
+	PC->PossessPlayer(Target);
 	PC->SetViewTarget(Camera);
 }
+
+// ---------------------------------------------------------------------------
+//  Свет и стадион
+// ---------------------------------------------------------------------------
 
 // Если в уровне нет солнца (например, File → New Level → Empty Level) — ставим свет сами:
 // основной источник с тенями и слабый заполняющий с противоположной стороны.
@@ -1439,22 +2161,31 @@ AStaticMeshActor* ASoccerGameMode::SpawnBox(const FVector& Center, const FVector
 
 void ASoccerGameMode::BuildField()
 {
-	const FLinearColor Grass(0.05f, 0.35f, 0.08f);
+	const FLinearColor GrassA(0.07f, 0.33f, 0.06f);   // полосы газона, как после стрижки
+	const FLinearColor GrassB(0.1f, 0.42f, 0.08f);
+	const FLinearColor Apron(0.05f, 0.25f, 0.05f);    // газон за бортами
 	const FLinearColor Line(0.95f, 0.95f, 0.95f);
-	const FLinearColor Board(0.12f, 0.12f, 0.15f);
 	const float LineW = 10.f;  // ширина линий разметки
-	const float LineZ = 0.5f;  // чуть выше газона, чтобы не мерцало
+	const float LineZ = 1.5f;  // чуть выше газона, чтобы не мерцало
+	const float WallY = HalfWidth + BoardGap;
+	const float WallX = HalfLength + GoalDepth;
 
-	// Газон (с запасом за линиями). Верх газона — Z = 0.
-	SpawnBox(FVector(0.f, 0.f, -10.f), FVector(2.f * HalfLength + 700.f, 2.f * HalfWidth + 400.f, 20.f), Grass, true);
+	// Основание (с коллизией — по нему бегают игроки). Верх — Z = 0.
+	SpawnBox(FVector(0.f, 0.f, -10.f), FVector(2.f * WallX + 2400.f, 2.f * WallY + 3000.f, 20.f), Apron, true);
 
-	// Борта — не дают игрокам уйти с поля (для мяча борта считаются в коде мяча)
-	SpawnBox(FVector(0.f,  HalfWidth + 70.f, 40.f), FVector(2.f * HalfLength + 600.f, 20.f, 80.f), Board, true);
-	SpawnBox(FVector(0.f, -HalfWidth - 70.f, 40.f), FVector(2.f * HalfLength + 600.f, 20.f, 80.f), Board, true);
-	SpawnBox(FVector( HalfLength + 280.f, 0.f, 40.f), FVector(20.f, 2.f * HalfWidth + 160.f, 80.f), Board, true);
-	SpawnBox(FVector(-HalfLength - 280.f, 0.f, 40.f), FVector(20.f, 2.f * HalfWidth + 160.f, 80.f), Board, true);
+	// Полосатый газон: 10 поперечных полос по 4 м
+	const int32 Stripes = 10;
+	const float StripeW = 2.f * HalfLength / Stripes;
+	for (int32 i = 0; i < Stripes; ++i)
+	{
+		const float X = -HalfLength + StripeW * (i + 0.5f);
+		SpawnBox(FVector(X, 0.f, 0.5f), FVector(StripeW, 2.f * WallY, 1.f), i % 2 ? GrassA : GrassB, false);
+	}
+	// Газон за лицевыми линиями
+	SpawnBox(FVector( HalfLength + GoalDepth * 0.5f, 0.f, 0.5f), FVector(GoalDepth, 2.f * WallY, 1.f), GrassA, false);
+	SpawnBox(FVector(-HalfLength - GoalDepth * 0.5f, 0.f, 0.5f), FVector(GoalDepth, 2.f * WallY, 1.f), GrassA, false);
 
-	// Внешние линии и средняя линия
+	// --- Разметка ---
 	SpawnBox(FVector(0.f,  HalfWidth, LineZ), FVector(2.f * HalfLength, LineW, 1.f), Line, false);
 	SpawnBox(FVector(0.f, -HalfWidth, LineZ), FVector(2.f * HalfLength, LineW, 1.f), Line, false);
 	SpawnBox(FVector( HalfLength, 0.f, LineZ), FVector(LineW, 2.f * HalfWidth, 1.f), Line, false);
@@ -1462,7 +2193,7 @@ void ASoccerGameMode::BuildField()
 	SpawnBox(FVector(0.f, 0.f, LineZ), FVector(LineW, 2.f * HalfWidth, 1.f), Line, false);
 
 	// Центральный круг (радиус 3 м) из коротких отрезков + центральная точка
-	const int32 Segments = 32;
+	const int32 Segments = 48;
 	const float CircleR = 300.f;
 	for (int32 i = 0; i < Segments; ++i)
 	{
@@ -1473,7 +2204,7 @@ void ASoccerGameMode::BuildField()
 	}
 	SpawnBox(FVector(0.f, 0.f, LineZ), FVector(25.f, 25.f, 1.f), Line, false);
 
-	// Штрафные площади (упрощённо — прямоугольники 6×11 м), точки пенальти, ворота
+	// Штрафные площади (упрощённо — прямоугольники), точки пенальти, ворота
 	const float BoxHalfW = GoalHalfWidth + 400.f;
 	for (int32 Side = -1; Side <= 1; Side += 2)
 	{
@@ -1483,40 +2214,198 @@ void ASoccerGameMode::BuildField()
 		SpawnBox(FVector(Side * (HalfLength - PenaltyDepth * 0.5f), -BoxHalfW, LineZ), FVector(PenaltyDepth, LineW, 1.f), Line, false);
 		SpawnBox(FVector(FrontX, 0.f, LineZ), FVector(25.f, 25.f, 1.f), Line, false);
 
-		// Ворота на +X защищают синие (1), на −X — красные (0)
+		// Ворота на +X защищает соперник (1), на −X — мы (0)
 		ASoccerGoal* Goal = GetWorld()->SpawnActor<ASoccerGoal>(
 			FVector(Side * HalfLength, 0.f, 0.f), FRotator(0.f, Side > 0 ? 0.f : 180.f, 0.f));
 		Goal->DefendingTeam = Side > 0 ? 1 : 0;
 	}
-}
 
-void ASoccerGameMode::SpawnTeams()
-{
-	// Расстановка 1-2-2 для красных (синие — зеркально по X).
-	// Индекс 0 — вратарь, 1–2 — защитники, 3–4 — нападающие.
-	const FVector2D Layout[5] = {
-		FVector2D(-HalfLength + 70.f, 0.f),
-		FVector2D(-1150.f, -450.f),
-		FVector2D(-1150.f,  450.f),
-		FVector2D(-450.f,  -350.f),
-		FVector2D(-450.f,   350.f),
+	// --- Рекламные борта (с коллизией: держат игроков; мяч отскакивает от них в коде мяча) ---
+	const FLinearColor BoardColors[4] = {
+		FLinearColor(0.02f, 0.02f, 0.025f), FLinearColor(0.95f, 0.3f, 0.02f),
+		FLinearColor(0.02f, 0.03f, 0.1f),   FLinearColor(0.7f, 0.04f, 0.03f)
 	};
-	const float SpawnZ = 92.f; // полувысота капсулы + зазор
-
-	FActorSpawnParameters Params;
-	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
-
-	for (int32 TeamIdx = 0; TeamIdx < 2; ++TeamIdx)
+	const float BoardH = 90.f;
+	const float PanelLen = 400.f;
+	const int32 SidePanels = FMath::CeilToInt(2.f * (WallX + 20.f) / PanelLen);
+	for (int32 i = 0; i < SidePanels; ++i)
 	{
-		const float Mirror = TeamIdx == 0 ? 1.f : -1.f;
-		for (int32 i = 0; i < 5; ++i)
+		const float X = -(WallX + 20.f) + PanelLen * (i + 0.5f);
+		for (int32 S = -1; S <= 1; S += 2)
 		{
-			const FVector Home(Layout[i].X * Mirror, Layout[i].Y, SpawnZ);
-			ASoccerPlayer* P = GetWorld()->SpawnActor<ASoccerPlayer>(Home, FRotator::ZeroRotator, Params);
-			P->Setup(TeamIdx, i == 0, Home);
-			Players.Add(P);
+			SpawnBox(FVector(X, S * (WallY + 10.f), BoardH * 0.5f), FVector(PanelLen, 20.f, BoardH),
+			         BoardColors[(i + (S > 0 ? 1 : 0)) % 4], true);
 		}
 	}
+	const int32 EndPanels = FMath::CeilToInt(2.f * WallY / PanelLen);
+	for (int32 i = 0; i < EndPanels; ++i)
+	{
+		const float Y = -WallY + PanelLen * (i + 0.5f);
+		for (int32 S = -1; S <= 1; S += 2)
+		{
+			SpawnBox(FVector(S * (WallX + 10.f), Y, BoardH * 0.5f), FVector(20.f, PanelLen, BoardH),
+			         BoardColors[(i + 2) % 4], true);
+		}
+	}
+
+	// --- Трибуна за дальним бортом: ступени с «сиденьями» и забор ---
+	const FLinearColor StandA(0.16f, 0.16f, 0.18f), StandB(0.11f, 0.11f, 0.13f);
+	const float StandLen = 2.f * WallX + 800.f;
+	for (int32 Row = 0; Row < 7; ++Row)
+	{
+		const float Height = 80.f * (Row + 1);
+		const float Y = -(WallY + 260.f + Row * 170.f);
+		SpawnBox(FVector(0.f, Y, Height * 0.5f), FVector(StandLen, 170.f, Height), Row % 2 ? StandA : StandB, true);
+		SpawnBox(FVector(0.f, Y + 40.f, Height + 8.f), FVector(StandLen, 40.f, 16.f),
+		         Row % 2 ? FLinearColor(0.35f, 0.04f, 0.04f) : FLinearColor(0.05f, 0.06f, 0.2f), false);
+	}
+	const FLinearColor Fence(0.08f, 0.08f, 0.09f);
+	for (float X = -StandLen * 0.5f; X <= StandLen * 0.5f; X += 300.f)
+	{
+		SpawnBox(FVector(X, -(WallY + 150.f), 160.f), FVector(8.f, 8.f, 320.f), Fence, false);
+	}
+	SpawnBox(FVector(0.f, -(WallY + 150.f), 320.f), FVector(StandLen, 6.f, 6.f), Fence, false);
+}
+
+// ---------------------------------------------------------------------------
+//  Правила матча
+// ---------------------------------------------------------------------------
+int32 ASoccerGameMode::GetPracticeTarget() const
+{
+	switch (MatchMode)
+	{
+	case ESoccerMode::PracticeShooting: return 5;
+	case ESoccerMode::PracticeOneOnOne: return 3;
+	case ESoccerMode::PracticeAttack:   return 4;
+	default:                            return 0;
+	}
+}
+
+FString ASoccerGameMode::GetTeamName(int32 InTeam) const
+{
+	if (InTeam == HumanTeam) return Save ? Save->ClubName : FString();
+	return AwayName;
+}
+
+void ASoccerGameMode::OnGoalScored(int32 ScoringTeam)
+{
+	if (!bInMatch || !bPlayActive) return; // мяч уже в сетке / матч окончен
+	Score[ScoringTeam]++;
+	bPlayActive = false;
+	GoalBanner = 2.f;
+	if (AimLine) AimLine->HidePath();
+	// Через 2 секунды — расстановка заново и розыгрыш с центра
+	GetWorldTimerManager().SetTimer(ResetTimer, this, &ASoccerGameMode::ResetPositions, 2.f, false);
+}
+
+void ASoccerGameMode::OnHumanPass()
+{
+	if (Save && bInMatch)
+	{
+		Save->PassesMade++;
+	}
+}
+
+void ASoccerGameMode::ResetPositions()
+{
+	if (!bInMatch || bMatchOver) return;
+
+	// Тренировка: цель выполнена — завершаем досрочно
+	if (IsPractice() && Score[0] >= GetPracticeTarget())
+	{
+		EndMatch();
+		return;
+	}
+
+	for (ASoccerPlayer* P : Players)
+	{
+		P->ResetToHome();
+	}
+	Ball->ResetBall(FVector(0.f, 0.f, BallRadius));
+	bPlayActive = true;
+}
+
+void ASoccerGameMode::EndMatch()
+{
+	if (bMatchOver) return;
+	bMatchOver = true;
+	bPlayActive = false;
+	if (AimLine) AimLine->HidePath();
+
+	// Награды и статистика
+	const int32 My = Score[0];
+	const int32 Their = Score[1];
+	Save->GoalsScored += My;
+	int32 Reward = 0;
+	FString Title;
+
+	if (IsPractice())
+	{
+		const int32 Index = (int32)MatchMode - 1;
+		const bool bDone = My >= GetPracticeTarget();
+		Reward = bDone ? (Save->PracticeDone[Index] ? 100 : 500) : 50;
+		if (bDone) Save->PracticeDone[Index] = true;
+		Title = bDone ? TEXT("ТРЕНИРОВКА ПРОЙДЕНА!") : TEXT("НЕ ХВАТИЛО ГОЛОВ");
+		ResultText = FText::FromString(FString::Printf(TEXT("%s   %d / %d   +%d монет"),
+		                                               *Title, My, GetPracticeTarget(), Reward));
+	}
+	else
+	{
+		Save->MatchesPlayed++;
+		Reward = 100 + 50 * My;
+		if (My > Their)       { Save->Wins++; Reward += 400; Title = TEXT("ПОБЕДА!"); }
+		else if (My == Their) { Reward += 150; Title = TEXT("НИЧЬЯ"); }
+		else                  { Title = TEXT("ПОРАЖЕНИЕ"); }
+		ResultText = FText::FromString(FString::Printf(TEXT("%s   %d : %d   +%d монет"), *Title, My, Their, Reward));
+	}
+	Save->Coins += Reward;
+	SaveProgress();
+
+	// Через 4 секунды — обратно в главное меню
+	GetWorldTimerManager().SetTimer(MenuTimer, this, &ASoccerGameMode::ReturnToMenu, 4.f, false);
+}
+
+// ---------------------------------------------------------------------------
+//  Данные для HUD и ИИ
+// ---------------------------------------------------------------------------
+ASoccerPlayer* ASoccerGameMode::GetTeamPlayer(int32 InTeam, int32 Index) const
+{
+	int32 N = 0;
+	for (ASoccerPlayer* P : Players)
+	{
+		if (P && P->Team == InTeam)
+		{
+			if (N == Index) return P;
+			++N;
+		}
+	}
+	return nullptr;
+}
+
+ASoccerPlayer* ASoccerGameMode::GetHumanPlayer() const
+{
+	const APlayerController* PC = GetWorld()->GetFirstPlayerController();
+	return PC ? Cast<ASoccerPlayer>(PC->GetPawn()) : nullptr;
+}
+
+// Соперник для правой карточки: владелец мяча или ближайший к мячу
+ASoccerPlayer* ASoccerGameMode::GetFocusOpponent() const
+{
+	if (!Ball) return nullptr;
+	if (Ball->OwnerPlayer && Ball->OwnerPlayer->Team != HumanTeam) return Ball->OwnerPlayer;
+	ASoccerPlayer* Best = nullptr;
+	float BestDist = TNumericLimits<float>::Max();
+	for (ASoccerPlayer* P : Players)
+	{
+		if (!P || P->Team == HumanTeam) continue;
+		const float D = FVector::Dist2D(P->GetActorLocation(), Ball->GetActorLocation());
+		if (D < BestDist)
+		{
+			BestDist = D;
+			Best = P;
+		}
+	}
+	return Best;
 }
 
 ASoccerPlayer* ASoccerGameMode::NearestToBall(int32 InTeam, bool bOnlyAI) const
@@ -1538,109 +2427,53 @@ ASoccerPlayer* ASoccerGameMode::NearestToBall(int32 InTeam, bool bOnlyAI) const
 	return Best;
 }
 
-float ASoccerGameMode::GetCameraYaw() const
-{
-	return CameraYaw;
-}
-
-void ASoccerGameMode::OnGoalScored(int32 ScoringTeam)
-{
-	if (!bPlayActive) return; // мяч уже в сетке / матч окончен
-	Score[ScoringTeam]++;
-	bPlayActive = false;
-	// Через 2 секунды — расстановка заново и розыгрыш с центра
-	GetWorldTimerManager().SetTimer(ResetTimer, this, &ASoccerGameMode::ResetPositions, 2.f, false);
-}
-
-void ASoccerGameMode::ResetPositions()
-{
-	if (bMatchOver) return;
-	for (ASoccerPlayer* P : Players)
-	{
-		P->ResetToHome();
-	}
-	Ball->ResetBall(FVector(0.f, 0.f, BallRadius));
-	bPlayActive = true;
-}
-
-void ASoccerGameMode::RestartMatch()
-{
-	GetWorldTimerManager().ClearTimer(ResetTimer);
-	Score[0] = Score[1] = 0;
-	TimeLeft = MatchLength;
-	bMatchOver = false;
-	ResetPositions();
-	// человек снова управляет нападающим
-	PossessHuman();
-}
-
+// ---------------------------------------------------------------------------
+//  Тик и камера
+// ---------------------------------------------------------------------------
 void ASoccerGameMode::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 	if (!Ball) return;
 
+	GoalBanner = FMath::Max(0.f, GoalBanner - DeltaSeconds);
+
 	// Таймер идёт только во время игры (пауза после гола не считается)
-	if (bPlayActive)
+	if (bInMatch && bPlayActive)
 	{
 		TimeLeft -= DeltaSeconds;
 		if (TimeLeft <= 0.f)
 		{
 			TimeLeft = 0.f;
-			bPlayActive = false;
-			bMatchOver = true;
+			EndMatch();
 		}
 	}
 
 	UpdateCamera(DeltaSeconds);
-	DrawHud();
 }
 
 void ASoccerGameMode::UpdateCamera(float Dt)
 {
 	if (!Camera || !Ball) return;
-	// Плавно следим за мячом, но не уезжаем далеко за пределы поля
+
+	if (!bInMatch)
+	{
+		// Меню: крупный план состава, камера медленно «дышит»
+		MenuTime += Dt;
+		const float Sway = FMath::Sin(MenuTime * 0.35f);
+		Camera->GetCameraComponent()->SetFieldOfView(50.f);
+		Camera->SetActorLocationAndRotation(FVector(380.f + Sway * 30.f, 720.f, 160.f),
+		                                    FRotator(-5.f, -90.f + Sway * 1.5f, 0.f));
+		return;
+	}
+
+	// Матч: «телевизионная» камера плавно следит за мячом, не уезжая за стадион
 	FVector Target = Ball->GetActorLocation();
-	Target.X = FMath::Clamp<double>(Target.X, -HalfLength + 900.f, HalfLength - 900.f);
-	Target.Y = FMath::Clamp<double>(Target.Y, -400.f, 400.f);
+	Target.X = FMath::Clamp<double>(Target.X, -HalfLength + 1150.f, HalfLength - 1150.f);
+	Target.Y = FMath::Clamp<double>(Target.Y - 200.0, -500.0, 450.0);
 	Target.Z = 0.f;
 	CamFocus = FMath::VInterpTo(CamFocus, Target, Dt, 2.5f);
 
 	const FRotator Rot(CameraPitch, CameraYaw, 0.f);
+	Camera->GetCameraComponent()->SetFieldOfView(CameraFOV);
 	Camera->SetActorLocationAndRotation(CamFocus - Rot.Vector() * CameraDistance, Rot);
-}
-
-void ASoccerGameMode::DrawHud()
-{
-	if (!GEngine) return;
-
-	// Без UMG: выводим текст отладочными сообщениями (у каждого свой ключ — строка обновляется)
-	GEngine->AddOnScreenDebugMessage(1, 0.1f, FColor::White,
-		FString::Printf(TEXT("КРАСНЫЕ  %d : %d  СИНИЕ        Время: %d"),
-		                Score[0], Score[1], FMath::CeilToInt(TimeLeft)),
-		true, FVector2D(1.8f, 1.8f));
-
-	if (bMatchOver)
-	{
-		const TCHAR* Result = Score[0] > Score[1] ? TEXT("Победа красных!")
-		                    : Score[0] < Score[1] ? TEXT("Победа синих!")
-		                                          : TEXT("Ничья");
-		GEngine->AddOnScreenDebugMessage(2, 0.1f, FColor::Yellow,
-			FString::Printf(TEXT("МАТЧ ОКОНЧЕН — %s   (Start / Enter — новый матч)"), Result),
-			true, FVector2D(1.5f, 1.5f));
-	}
-	else if (!bPlayActive)
-	{
-		GEngine->AddOnScreenDebugMessage(2, 0.1f, FColor::Yellow, TEXT("ГОЛ!"), true, FVector2D(3.f, 3.f));
-	}
-
-	// Шкала силы удара, пока зажата B
-	if (const ASoccerPlayerController* PC = Cast<ASoccerPlayerController>(GetWorld()->GetFirstPlayerController()))
-	{
-		const float Charge = PC->GetShotCharge();
-		if (Charge >= 0.f)
-		{
-			GEngine->AddOnScreenDebugMessage(3, 0.1f, FColor::Orange,
-				TEXT("Сила удара: ") + FString::ChrN(FMath::RoundToInt(Charge * 20.f), TEXT('|')));
-		}
-	}
 }

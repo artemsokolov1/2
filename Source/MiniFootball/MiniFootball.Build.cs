@@ -7,7 +7,8 @@ public class MiniFootball : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
-		// EnhancedInput — обязателен: ввод геймпада/клавиатуры создаётся через него
+		// EnhancedInput — ввод геймпада/клавиатуры; Slate/SlateCore — меню и HUD (SoccerUI.cpp)
 		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput" });
+		PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
 	}
 }
