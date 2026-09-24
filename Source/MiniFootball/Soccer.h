@@ -27,6 +27,8 @@ class USphereComponent;
 class UBoxComponent;
 class UStaticMeshComponent;
 class UStaticMesh;
+class USkeletalMesh;
+class UAnimSequence;
 class UInputAction;
 class UInputMappingContext;
 class ACameraActor;
@@ -38,17 +40,17 @@ class SWidget;
 struct FInputActionValue;
 struct FKey;
 
-// Размеры в сантиметрах (1 uu = 1 см). Поле 40×24 м, ворота 3×2 м.
+// Размеры в сантиметрах (1 uu = 1 см). Поле 40×27 м, ворота 3×2 м.
 // Центр поля — (0,0,0). Длинная ось поля — X, ширина — Y.
 // Команда 0 (человек) атакует в сторону +X, команда 1 — в сторону −X.
 namespace Soccer
 {
 	constexpr float HalfLength    = 2000.f; // половина длины поля
-	constexpr float HalfWidth     = 1200.f; // половина ширины поля
+	constexpr float HalfWidth     = 1350.f; // половина ширины поля
 	constexpr float GoalHalfWidth = 150.f;  // половина ширины ворот
 	constexpr float GoalHeight    = 200.f;  // высота ворот
 	constexpr float GoalDepth     = 100.f;  // глубина ворот (до задней сетки)
-	constexpr float BoardGap      = 150.f;  // от боковой линии до рекламного борта
+	constexpr float BoardGap      = 10.f;   // борт стоит сразу за боковой линией — линии «настоящие»
 	constexpr float BallRadius    = 22.f;   // радиус мяча
 	constexpr float PenaltyDepth  = 600.f;  // глубина штрафной площади
 	constexpr int32 HumanTeam     = 0;      // человек играет за команду 0
@@ -166,8 +168,9 @@ public:
 	// Поставить мяч в точку и обнулить всё состояние.
 	void ResetBall(const FVector& Location);
 
-	// Сколько секунд прошло с последнего удара.
+	// Сколько секунд прошло с последнего удара и когда он был.
 	float TimeSinceKick() const;
+	float GetLastKickTime() const { return LastKickTime; }
 
 	// Прогноз полёта мяча (та же физика, что в Tick) — для белой линии прицела.
 	void PredictPath(const FVector& Start, const FVector& StartVelocity, const FVector& Curve,
@@ -265,6 +268,8 @@ public:
 	           const FSoccerPlayerInfo& InInfo, int32 InRosterIndex,
 	           const FLinearColor& Shirt, const FLinearColor& Shorts);
 	void ResetToHome();
+	// 3D-модель футболиста (Mixamo) с анимациями «стоит» и «бежит». Без модели остаёмся капсулой.
+	void ApplyCharacterModel(USkeletalMesh* InMesh, UAnimSequence* InIdle, UAnimSequence* InRun);
 
 	// ---------- Удары и пасы ----------
 	// Расчёт удара без исполнения (для линии прицела) и исполнение.
@@ -303,8 +308,11 @@ public:
 	UPROPERTY(VisibleAnywhere) TObjectPtr<UStaticMeshComponent> Feet;
 	UPROPERTY(VisibleAnywhere) TObjectPtr<UStaticMeshComponent> Head;
 	UPROPERTY(VisibleAnywhere) TObjectPtr<UStaticMeshComponent> Marker;
+	// Цветной круг под ногами — цвет команды (нужен, когда у всех одинаковая 3D-модель)
+	UPROPERTY(VisibleAnywhere) TObjectPtr<UStaticMeshComponent> Ring;
 
 private:
+	void UpdateAnimation();
 	void TickHuman(float Dt);
 	void TickFieldAI(float Dt);
 	void TickAIWithBall(float Dt);
@@ -330,6 +338,13 @@ private:
 	float AIDecisionTimer = 0.f;
 	float GKReactionTimer = 0.f;
 	float GKTargetY = 0.f;
+	float GKDecisionKick = -1000.f; // удар, по которому вратарь уже решил, берёт ли он его
+	bool bGKWillSave = false;
+	float GKTackleCooldown = 0.f;
+
+	UPROPERTY() TObjectPtr<UAnimSequence> IdleAnim;
+	UPROPERTY() TObjectPtr<UAnimSequence> RunAnim;
+	UPROPERTY() TObjectPtr<UAnimSequence> CurrentAnim;
 
 	FVector DashDir = FVector::ZeroVector;
 	float DashSpeed = 0.f;
@@ -340,7 +355,9 @@ private:
 	static constexpr float RunSpeed    = 450.f;
 	static constexpr float SprintSpeed = 680.f;
 	static constexpr float SlowSpeed   = 260.f; // укрывание мяча / жокей
-	static constexpr float KeeperSpeed = 480.f;
+	static constexpr float KeeperSpeed = 420.f;
+	static constexpr float RunAnimSpeed = 480.f; // скорость (см/с), при которой анимация бега идёт 1:1
+	static constexpr float MeshYawOffset = -90.f; // модели Mixamo после импорта смотрят вдоль +Y
 };
 
 // ============================================================================
@@ -416,6 +433,7 @@ private:
 	ECharge Charging = ECharge::None; // какая кнопка удара/паса зажата
 	float ChargeStart = 0.f;          // когда начали замах
 	bool bRightStickArmed = true;     // для распознавания «щелчка» правым стиком
+	float LastSwitchTime = -100.f;    // для перебора игроков повторными нажатиями LB
 };
 
 // ============================================================================
@@ -489,6 +507,7 @@ public:
 
 private:
 	void LoadProgress();
+	void LoadCharacterAssets();
 	void EnsureLighting();
 	void BuildField();
 	AStaticMeshActor* SpawnBox(const FVector& Center, const FVector& Size, const FLinearColor& Color,
@@ -509,6 +528,10 @@ private:
 
 	UPROPERTY() TObjectPtr<UStaticMesh> CubeMesh;
 	UPROPERTY() TObjectPtr<USoccerSave> Save;
+	// Модель и анимации футболиста из Content/Characters/Footballer (если импортированы)
+	UPROPERTY() TObjectPtr<USkeletalMesh> FootballerMesh;
+	UPROPERTY() TObjectPtr<UAnimSequence> FootballerIdle;
+	UPROPERTY() TObjectPtr<UAnimSequence> FootballerRun;
 
 	TSharedPtr<SWidget> MenuWidget;
 	TSharedPtr<SWidget> HudWidget;

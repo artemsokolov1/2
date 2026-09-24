@@ -91,6 +91,37 @@ git clone -b claude/jolly-sagan-2ec7n4 https://github.com/artemsokolov1/2.git F:
 
 Логи редактора лежат в `F:\MiniFootball\Saved\Logs`.
 
+## 3D-модель футболиста (Mixamo)
+
+Все футболисты используют одну модель с анимациями **Idle** (стоит) и **Running** (бежит). Команды различаются цветным кругом под ногами. Пока модель не импортирована, игроки остаются капсулами.
+
+**1. Скачать с Mixamo** (формат *FBX Binary*):
+- персонаж — *With Skin*;
+- Idle — можно *Without Skin*;
+- Running — *Without Skin* и обязательно галочка **In Place**, иначе персонаж будет «уезжать» из капсулы.
+
+**2. Положить исходники** (для архива в GitHub, Unreal их не читает) в `F:\MiniFootball\SourceArt\Footballer\`.
+
+**3. Импортировать в Unreal.** Content Browser → папка `Content/Characters/Footballer` (есть в проекте после `git pull`):
+- перетащите FBX персонажа → в окне импорта оставьте Skeletal Mesh, материалы и текстуры → **Import**;
+- перетащите `Idle.fbx` и `Running.fbx` → в поле **Skeleton** выберите скелет персонажа (`…_Skeleton`), импорт меша выключите → **Import**;
+- в названиях анимаций должно быть `Idle` и `Run` (например `Idle`, `Running`). Переименовать можно клавишей F2;
+- нажмите **Save All** (Ctrl+Shift+S).
+
+**4. Play.** Вверху экрана на 10 секунд появится жёлтая строка: какая модель и какие анимации найдены. Если модель смотрит вбок, в `Soccer.h` поменяйте `MeshYawOffset`.
+
+**5. Отправить на GitHub** (Unreal закрыт):
+
+```bat
+cd /d F:\MiniFootball
+git pull
+git add Content SourceArt
+git commit -m "Add Mixamo footballer model and animations"
+git push
+```
+
+При первом `git push` откроется окно входа в GitHub, войдите своим аккаунтом. Каждый файл должен быть меньше 100 МБ (модели Mixamo обычно 5–30 МБ).
+
 ## Файлы
 
 | Файл | Что внутри |
@@ -103,6 +134,8 @@ git clone -b claude/jolly-sagan-2ec7n4 https://github.com/artemsokolov1/2.git F:
 | `Source/MiniFootball/Soccer.h` | **Геймплей:** объявления всех классов и константы поля |
 | `Source/MiniFootball/Soccer.cpp` | **Геймплей:** мяч, ворота, линия прицела, игрок и ИИ, контроллер, стадион, GameMode, сохранения |
 | `Source/MiniFootball/SoccerUI.cpp` | **Интерфейс:** главное меню со всеми разделами, HUD матча, пауза |
+| `Content/Characters/Footballer/` | 3D-модель футболиста и анимации (импортированные `.uasset`) |
+| `SourceArt/Footballer/` | Исходные FBX из Mixamo |
 
 Классы:
 
@@ -189,5 +222,5 @@ git clone -b claude/jolly-sagan-2ec7n4 https://github.com/artemsokolov1/2.git F:
 
 - Ауты и угловые не реализованы: поле окружено бортами, как в зале.
 - Мяч не сталкивается с игроками физически. Приём, отбор и сейвы — логика по дистанции.
-- Игроки — капсулы в форме: без анимаций и скелетных моделей.
+- Без импортированной модели игроки — капсулы. С моделью Mixamo есть только анимации «стоит» и «бежит»: удары и подкаты без отдельных анимаций.
 - «Друзья» — это клубы под управлением компьютера, сетевой игры нет.

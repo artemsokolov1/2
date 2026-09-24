@@ -9,6 +9,7 @@ public class MiniFootball : ModuleRules
 
 		// EnhancedInput — ввод геймпада/клавиатуры; Slate/SlateCore — меню и HUD (SoccerUI.cpp)
 		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput" });
-		PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
+		// AssetRegistry — поиск 3D-модели футболиста в Content/Characters/Footballer
+		PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore", "AssetRegistry" });
 	}
 }

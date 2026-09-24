@@ -8,12 +8,17 @@
 #include "Components/StaticMeshComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/LightComponent.h"
+#include "Components/SkeletalMeshComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Camera/CameraActor.h"
 #include "Camera/CameraComponent.h"
 #include "Engine/StaticMeshActor.h"
 #include "Engine/DirectionalLight.h"
 #include "Engine/StaticMesh.h"
+#include "Engine/SkeletalMesh.h"
+#include "Animation/AnimSequence.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "Modules/ModuleManager.h"
 #include "Engine/LocalPlayer.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
@@ -326,46 +331,29 @@ void ASoccerBall::Integrate(FVector& P, FVector& V, const FVector& Curve, float&
 void ASoccerBall::CollideWithWalls(FVector& P, const FVector& OldP, FVector& V) const
 {
 	const float R = BallRadius;
-	const float WallY = HalfWidth + BoardGap;   // рекламные борта вдоль поля
-	const float WallX = HalfLength + GoalDepth; // борта за воротами
+	const float WallY = HalfWidth + BoardGap; // борт стоит сразу за боковой линией
 
+	// Боковые линии: мяч отскакивает от борта у самой линии
 	if (FMath::Abs(P.Y) > WallY - R)
 	{
 		P.Y = FMath::Sign(P.Y) * (WallY - R);
 		V.Y = -FMath::Sign(P.Y) * FMath::Abs(V.Y) * WallBounciness;
 	}
-	if (FMath::Abs(P.X) > WallX - R)
-	{
-		P.X = FMath::Sign(P.X) * (WallX - R);
-		V.X = -FMath::Sign(P.X) * FMath::Abs(V.X) * WallBounciness;
-	}
 
-	// Ворота — «коробка» за линией ворот
-	auto InGoal = [](const FVector& Q)
+	// Лицевые линии: за линию ворот мяч уходит только в створ,
+	// в штангу/перекладину и мимо ворот — отскок от линии
+	const bool bWasInGoal = FMath::Abs(OldP.X) > HalfLength;
+	if (!bWasInGoal && FMath::Abs(P.X) > HalfLength - R)
 	{
-		return FMath::Abs(Q.X) > HalfLength && FMath::Abs(Q.Y) < GoalHalfWidth && Q.Z < GoalHeight;
-	};
-
-	if (!InGoal(OldP) && InGoal(P))
-	{
-		// Внутрь можно только через створ — пересекая линию ворот со стороны поля
-		const bool bThroughMouth = FMath::Abs(OldP.X) <= HalfLength;
-		if (!bThroughMouth)
+		const bool bInMouth = FMath::Abs(P.Y) < GoalHalfWidth - R && P.Z < GoalHeight - R;
+		if (!bInMouth)
 		{
-			if (FMath::Abs(OldP.Y) >= GoalHalfWidth)
-			{
-				P.Y = FMath::Sign(OldP.Y) * (GoalHalfWidth + R); // боковая сетка снаружи
-				V.Y *= -0.3f;
-			}
-			else
-			{
-				P.Z = GoalHeight + R;                            // крыша ворот
-				V.Z = FMath::Abs(V.Z) * 0.3f;
-			}
+			P.X = FMath::Sign(P.X) * (HalfLength - R);
+			V.X = -FMath::Sign(P.X) * FMath::Abs(V.X) * WallBounciness;
 		}
 	}
 
-	if (InGoal(P))
+	if (FMath::Abs(P.X) > HalfLength)
 	{
 		// Внутри ворот сетка гасит мяч
 		const float Back = HalfLength + GoalDepth - R;
@@ -575,6 +563,10 @@ ASoccerPlayer::ASoccerPlayer()
 	                    FRotator(180.f, 0.f, 0.f));
 	Marker->SetCastShadow(false);
 	Marker->SetVisibility(false);
+	// Круг цвета команды под ногами — включается вместе с 3D-моделью
+	Ring = MakeVisual(this, Parent, TEXT("Ring"), Cyl.Object, FVector(0.f, 0.f, -88.f), FVector(0.9f, 0.9f, 0.015f));
+	Ring->SetCastShadow(false);
+	Ring->SetVisibility(false);
 }
 
 void ASoccerPlayer::Setup(int32 InTeam, bool bInGoalkeeper, const FVector& InHome, float InHomeYaw,
@@ -597,8 +589,53 @@ void ASoccerPlayer::Setup(int32 InTeam, bool bInGoalkeeper, const FVector& InHom
 	Paint(Feet, Shorts);
 	Paint(Head, Skins[GetTypeHash(Info.Name) % 3]);
 	Paint(Marker, FLinearColor(0.35f, 1.f, 0.02f));
+	Paint(Ring, Shirt);
 
 	ResetToHome();
+}
+
+void ASoccerPlayer::ApplyCharacterModel(USkeletalMesh* InMesh, UAnimSequence* InIdle, UAnimSequence* InRun)
+{
+	if (!InMesh) return; // модели нет — остаёмся капсулой
+
+	// Встроенный в ACharacter скелетный меш: ноги на дне капсулы, лицом вперёд (+X)
+	USkeletalMeshComponent* SkelMesh = GetMesh();
+	SkelMesh->SetSkeletalMeshAsset(InMesh);
+	SkelMesh->SetRelativeLocationAndRotation(FVector(0.f, 0.f, -GetCapsuleComponent()->GetUnscaledCapsuleHalfHeight()),
+	                                         FRotator(0.f, MeshYawOffset, 0.f));
+	SkelMesh->SetAnimationMode(EAnimationMode::AnimationSingleNode);
+
+	IdleAnim = InIdle;
+	RunAnim = InRun;
+	CurrentAnim = nullptr;
+
+	// Капсулу прячем, вместо формы — круг цвета команды под ногами
+	Body->SetVisibility(false);
+	Top->SetVisibility(false);
+	Feet->SetVisibility(false);
+	Head->SetVisibility(false);
+	Ring->SetVisibility(true);
+
+	UpdateAnimation();
+}
+
+// Анимация по скорости: стоит — Idle, бежит — Running (скорость проигрывания под темп бега)
+void ASoccerPlayer::UpdateAnimation()
+{
+	if (!IdleAnim && !RunAnim) return;
+
+	const float Speed = GetVelocity().Size2D();
+	// Гистерезис, чтобы анимация не дёргалась на границе: бег с 80 см/с, обратно в Idle ниже 40
+	const bool bRunning = RunAnim && Speed > (CurrentAnim == RunAnim ? 40.f : 80.f);
+	UAnimSequence* Want = bRunning ? RunAnim.Get() : (IdleAnim ? IdleAnim.Get() : RunAnim.Get());
+
+	USkeletalMeshComponent* SkelMesh = GetMesh();
+	if (Want != CurrentAnim)
+	{
+		SkelMesh->PlayAnimation(Want, true);
+		CurrentAnim = Want;
+	}
+	SkelMesh->SetPlayRate(bRunning ? FMath::Clamp(Speed / RunAnimSpeed, 0.7f, 1.6f) : 1.f);
 }
 
 void ASoccerPlayer::ResetToHome()
@@ -689,11 +726,13 @@ void ASoccerPlayer::Tick(float Dt)
 	if (!G || !G->Ball) return;
 
 	Marker->SetVisibility(IsPlayerControlled());
+	UpdateAnimation();
 
 	StunTime       = FMath::Max(0.f, StunTime - Dt);
 	TackleCooldown = FMath::Max(0.f, TackleCooldown - Dt);
 	SkillCooldown  = FMath::Max(0.f, SkillCooldown - Dt);
 	ProtectTime    = FMath::Max(0.f, ProtectTime - Dt);
+	GKTackleCooldown = FMath::Max(0.f, GKTackleCooldown - Dt);
 	AIDecisionTimer -= Dt;
 
 	// В меню, после гола и после финального свистка все стоят
@@ -998,8 +1037,9 @@ void ASoccerPlayer::TickGoalkeeper(float Dt)
 	const float GoalX = Side * HalfLength;
 
 	// Задержка реакции: у вратаря соперника зависит от сложности, у нашего — средняя
-	static const float Reactions[3] = { 0.25f, 0.15f, 0.1f };
-	const float Reaction = Team == HumanTeam ? 0.15f : Reactions[FMath::Clamp(G->GetDifficulty(), 0, 2)];
+	const int32 Diff = FMath::Clamp(G->GetDifficulty(), 0, 2);
+	static const float Reactions[3] = { 0.3f, 0.22f, 0.15f };
+	const float Reaction = Team == HumanTeam ? 0.22f : Reactions[Diff];
 
 	GKReactionTimer -= Dt;
 	if (GKReactionTimer <= 0.f)
@@ -1015,7 +1055,8 @@ void ASoccerPlayer::TickGoalkeeper(float Dt)
 				GKTargetY = BallLoc.Y + Ball->Velocity.Y * T;
 			}
 		}
-		GKTargetY = FMath::Clamp(GKTargetY, -GoalHalfWidth + 30.f, GoalHalfWidth - 30.f);
+		// К самой штанге вратарь не прилипает — углы остаются открытыми
+		GKTargetY = FMath::Clamp(GKTargetY, -GoalHalfWidth + 55.f, GoalHalfWidth - 55.f);
 	}
 	FVector Target(GoalX - Side * 70.f, GKTargetY, Me.Z);
 
@@ -1037,11 +1078,56 @@ void ASoccerPlayer::TickGoalkeeper(float Dt)
 	MoveTo(Target, bRush ? KeeperSpeed * 1.3f : KeeperSpeed);
 	FaceTowards(BallLoc, Dt);
 
-	// Отбить мяч, если дотягиваемся
+	// Сейв: мяч в зоне досягаемости — вратарь пытается его отбить
 	const FVector ToBall = BallLoc - Me;
-	const bool bReach = ToBall.Size2D() < 110.f && BallLoc.Z < 230.f;
+	const bool bReach = ToBall.Size2D() < 95.f && BallLoc.Z < 220.f;
 	const bool bJustKicked = Ball->LastKicker == this && Ball->TimeSinceKick() < 0.5f;
-	if (bReach && !bTeammateHasBall && !bJustKicked)
+	if (!bReach || bTeammateHasBall || bJustKicked)
+	{
+		return;
+	}
+
+	bool bSave = false;
+	if (Ball->OwnerPlayer)
+	{
+		// Нападающий с мячом рядом — бросок в ноги, не чаще раза в секунду
+		if (GKTackleCooldown <= 0.f)
+		{
+			GKTackleCooldown = 1.f;
+			bSave = FMath::FRand() < 0.45f;
+		}
+	}
+	else if (Ball->Velocity.Size2D() < 600.f)
+	{
+		bSave = true; // медленный мяч вратарь просто забирает
+	}
+	else
+	{
+		// Удар по воротам: «возьму / не возьму» решается один раз на каждый удар.
+		// Сильный удар, удар в угол и мяч далеко от корпуса снижают шанс сейва.
+		if (GKDecisionKick != Ball->GetLastKickTime())
+		{
+			GKDecisionKick = Ball->GetLastKickTime();
+
+			static const float BaseSave[3] = { 0.6f, 0.72f, 0.82f };
+			float Chance = Team == HumanTeam ? 0.72f : BaseSave[Diff];
+			Chance -= FMath::Max(0.f, (float)Ball->Velocity.Size2D() - 1200.f) / 5000.f;
+
+			float CrossY = BallLoc.Y; // где мяч пересечёт линию ворот
+			if (FMath::Abs(Ball->Velocity.X) > 1.f)
+			{
+				const float T = (GoalX - BallLoc.X) / Ball->Velocity.X;
+				if (T > 0.f) CrossY = BallLoc.Y + Ball->Velocity.Y * T;
+			}
+			Chance -= 0.35f * FMath::Clamp(FMath::Abs(CrossY) / GoalHalfWidth, 0.f, 1.f);
+			Chance -= FMath::Abs(BallLoc.Y - Me.Y) / 300.f;
+
+			bGKWillSave = FMath::FRand() < FMath::Clamp(Chance, 0.08f, 0.9f);
+		}
+		bSave = bGKWillSave;
+	}
+
+	if (bSave)
 	{
 		if (Ball->OwnerPlayer) Ball->OwnerPlayer->Stun(0.5f); // забрал мяч у нападающего в ногах
 		// выбиваем в поле и в сторону от центра ворот
@@ -1544,26 +1630,45 @@ void ASoccerPlayerController::SwitchPlayer(const FVector& Dir)
 	ASoccerPlayer* Cur = Current();
 	if (!G || !G->Ball || !Cur) return;
 
+	if (Dir.IsNearlyZero())
+	{
+		// LB: полевые игроки по удалённости от мяча. Первое нажатие — ближайший к мячу,
+		// быстрые повторные нажатия перебирают всех остальных по кругу: дальше и дальше.
+		TArray<ASoccerPlayer*> Order;
+		for (ASoccerPlayer* P : G->Players)
+		{
+			if (P && P->Team == HumanTeam && !P->bGoalkeeper) Order.Add(P);
+		}
+		if (Order.Num() < 2) return;
+
+		const FVector BallLoc = G->Ball->GetActorLocation();
+		Order.Sort([&BallLoc](const ASoccerPlayer& A, const ASoccerPlayer& B)
+		{
+			return FVector::DistSquared2D(A.GetActorLocation(), BallLoc) < FVector::DistSquared2D(B.GetActorLocation(), BallLoc);
+		});
+
+		const float Now = GetWorld()->GetTimeSeconds();
+		const bool bCycling = Now - LastSwitchTime < 1.5f;
+		LastSwitchTime = Now;
+
+		const int32 CurIdx = Order.IndexOfByKey(Cur);
+		const int32 NextIdx = bCycling ? (CurIdx + 1) % Order.Num()   // следующий по удалённости
+		                               : (CurIdx == 0 ? 1 : 0);      // ближайший к мячу (если это вы — второй)
+		PossessPlayer(Order[NextIdx]);
+		return;
+	}
+
+	// Правый стик: партнёр в направлении щелчка
 	ASoccerPlayer* Best = nullptr;
 	float BestScore = TNumericLimits<float>::Max();
 	for (ASoccerPlayer* P : G->Players)
 	{
 		if (P == Cur || P->Team != HumanTeam || P->bGoalkeeper) continue;
-		float Score;
-		if (Dir.IsNearlyZero())
-		{
-			// LB: ближайший к мячу
-			Score = FVector::Dist2D(P->GetActorLocation(), G->Ball->GetActorLocation());
-		}
-		else
-		{
-			// Правый стик: партнёр в направлении щелчка
-			FVector To = P->GetActorLocation() - Cur->GetActorLocation();
-			To.Z = 0.f;
-			const float Dot = FVector::DotProduct(To.GetSafeNormal(), Dir);
-			if (Dot < 0.5f) continue;
-			Score = To.Size() * (2.f - Dot);
-		}
+		FVector To = P->GetActorLocation() - Cur->GetActorLocation();
+		To.Z = 0.f;
+		const float Dot = FVector::DotProduct(To.GetSafeNormal(), Dir);
+		if (Dot < 0.3f) continue;
+		const float Score = To.Size() * (2.f - Dot);
 		if (Score < BestScore)
 		{
 			BestScore = Score;
@@ -1733,6 +1838,7 @@ void ASoccerGameMode::BeginPlay()
 	Super::BeginPlay();
 
 	LoadProgress();
+	LoadCharacterAssets();
 	EnsureLighting();
 	BuildField();
 
@@ -1789,6 +1895,57 @@ void ASoccerGameMode::LoadProgress()
 	Save->StarterIndex = FMath::Clamp(Save->StarterIndex, 1, 4);
 	Save->MatchMinutes = FMath::Clamp(Save->MatchMinutes, 1, 3);
 	Save->Difficulty = FMath::Clamp(Save->Difficulty, 0, 2);
+}
+
+// 3D-модель футболиста: ищем в папке Content/Characters/Footballer любой Skeletal Mesh
+// и анимации, в названии которых есть «Idle» (стоит) и «Run» (бежит, например Running).
+void ASoccerGameMode::LoadCharacterAssets()
+{
+	const FString Folder = TEXT("/Game/Characters/Footballer");
+	IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+#if WITH_EDITOR
+	Registry.ScanPathsSynchronous({ Folder }, true);
+#endif
+	TArray<FAssetData> Assets;
+	Registry.GetAssetsByPath(FName(*Folder), Assets, true);
+
+	for (const FAssetData& Data : Assets)
+	{
+		const FString AssetName = Data.AssetName.ToString();
+		UObject* Obj = Data.GetAsset();
+		if (USkeletalMesh* SkelMesh = Cast<USkeletalMesh>(Obj))
+		{
+			if (!FootballerMesh) FootballerMesh = SkelMesh;
+		}
+		else if (UAnimSequence* Anim = Cast<UAnimSequence>(Obj))
+		{
+			if (AssetName.Contains(TEXT("Idle")))     FootballerIdle = Anim;
+			else if (AssetName.Contains(TEXT("Run"))) FootballerRun = Anim;
+		}
+	}
+
+	// Подсказка в окне игры: что нашлось (видно при запуске из редактора)
+	FString Report;
+	if (!FootballerMesh)
+	{
+		Report = TEXT("3D-модель не найдена в Content/Characters/Footballer — игроки будут капсулами");
+	}
+	else
+	{
+		Report = FString::Printf(TEXT("Модель: %s | Idle: %s | Бег: %s"), *FootballerMesh->GetName(),
+		                         FootballerIdle ? *FootballerIdle->GetName() : TEXT("нет"),
+		                         FootballerRun ? *FootballerRun->GetName() : TEXT("нет"));
+		const USkeleton* Skel = FootballerMesh->GetSkeleton();
+		if ((FootballerIdle && FootballerIdle->GetSkeleton() != Skel) || (FootballerRun && FootballerRun->GetSkeleton() != Skel))
+		{
+			Report += TEXT("\nВНИМАНИЕ: анимации импортированы с другим скелетом — переимпортируйте их, выбрав скелет персонажа");
+		}
+	}
+	UE_LOG(LogTemp, Log, TEXT("Soccer: %s"), *Report);
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 10.f, FColor::Yellow, Report);
+	}
 }
 
 void ASoccerGameMode::SaveProgress()
@@ -2032,6 +2189,7 @@ ASoccerPlayer* ASoccerGameMode::SpawnPlayer(int32 InTeam, int32 RosterIdx, const
 		Shorts = FLinearColor(0.9f, 0.9f, 0.9f);
 	}
 	P->Setup(InTeam, bGK, Location, Yaw, PlayerInfo, RosterIdx, Shirt, Shorts);
+	P->ApplyCharacterModel(FootballerMesh, FootballerIdle, FootballerRun); // все футболисты — одна модель
 	Players.Add(P);
 	return P;
 }
@@ -2220,32 +2378,47 @@ void ASoccerGameMode::BuildField()
 		Goal->DefendingTeam = Side > 0 ? 1 : 0;
 	}
 
-	// --- Рекламные борта (с коллизией: держат игроков; мяч отскакивает от них в коде мяча) ---
+	// --- Рекламные борта вплотную к линиям поля (с коллизией: держат игроков;
+	//     мяч отскакивает от линий в коде мяча) ---
 	const FLinearColor BoardColors[4] = {
 		FLinearColor(0.02f, 0.02f, 0.025f), FLinearColor(0.95f, 0.3f, 0.02f),
 		FLinearColor(0.02f, 0.03f, 0.1f),   FLinearColor(0.7f, 0.04f, 0.03f)
 	};
 	const float BoardH = 90.f;
 	const float PanelLen = 400.f;
-	const int32 SidePanels = FMath::CeilToInt(2.f * (WallX + 20.f) / PanelLen);
+
+	// Вдоль боковых линий
+	const float SideLen = 2.f * (HalfLength + 30.f);
+	const int32 SidePanels = FMath::CeilToInt(SideLen / PanelLen);
+	const float SidePanel = SideLen / SidePanels;
 	for (int32 i = 0; i < SidePanels; ++i)
 	{
-		const float X = -(WallX + 20.f) + PanelLen * (i + 0.5f);
+		const float X = -SideLen * 0.5f + SidePanel * (i + 0.5f);
 		for (int32 S = -1; S <= 1; S += 2)
 		{
-			SpawnBox(FVector(X, S * (WallY + 10.f), BoardH * 0.5f), FVector(PanelLen, 20.f, BoardH),
+			SpawnBox(FVector(X, S * (WallY + 10.f), BoardH * 0.5f), FVector(SidePanel, 20.f, BoardH),
 			         BoardColors[(i + (S > 0 ? 1 : 0)) % 4], true);
 		}
 	}
-	const int32 EndPanels = FMath::CeilToInt(2.f * WallY / PanelLen);
-	for (int32 i = 0; i < EndPanels; ++i)
+
+	// Вдоль лицевых линий — по бокам от ворот (сами ворота закрыты сеткой) и за воротами
+	const float EndFrom = GoalHalfWidth + 10.f;
+	const float EndLen = WallY + 20.f - EndFrom;
+	const int32 EndPanels = FMath::CeilToInt(EndLen / PanelLen);
+	const float EndPanel = EndLen / EndPanels;
+	for (int32 S = -1; S <= 1; S += 2)
 	{
-		const float Y = -WallY + PanelLen * (i + 0.5f);
-		for (int32 S = -1; S <= 1; S += 2)
+		for (int32 T = -1; T <= 1; T += 2)
 		{
-			SpawnBox(FVector(S * (WallX + 10.f), Y, BoardH * 0.5f), FVector(20.f, PanelLen, BoardH),
-			         BoardColors[(i + 2) % 4], true);
+			for (int32 i = 0; i < EndPanels; ++i)
+			{
+				const float Y = T * (EndFrom + EndPanel * (i + 0.5f));
+				SpawnBox(FVector(S * (HalfLength + 20.f), Y, BoardH * 0.5f), FVector(20.f, EndPanel, BoardH),
+				         BoardColors[(i + 2) % 4], true);
+			}
 		}
+		SpawnBox(FVector(S * (WallX + 10.f), 0.f, BoardH * 0.5f), FVector(20.f, 2.f * EndFrom + 40.f, BoardH),
+		         BoardColors[1], true);
 	}
 
 	// --- Трибуна за дальним бортом: ступени с «сиденьями» и забор ---
@@ -2469,7 +2642,7 @@ void ASoccerGameMode::UpdateCamera(float Dt)
 	// Матч: «телевизионная» камера плавно следит за мячом, не уезжая за стадион
 	FVector Target = Ball->GetActorLocation();
 	Target.X = FMath::Clamp<double>(Target.X, -HalfLength + 1150.f, HalfLength - 1150.f);
-	Target.Y = FMath::Clamp<double>(Target.Y - 200.0, -500.0, 450.0);
+	Target.Y = FMath::Clamp<double>(Target.Y - 200.0, -600.0, 600.0);
 	Target.Z = 0.f;
 	CamFocus = FMath::VInterpTo(CamFocus, Target, Dt, 2.5f);
 
