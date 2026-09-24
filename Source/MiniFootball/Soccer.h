@@ -94,6 +94,7 @@ struct FSoccerKick
 	FVector Velocity = FVector::ZeroVector;
 	FVector Curve = FVector::ZeroVector;
 	float CurveTime = 0.f;
+	FVector Target = FVector::ZeroVector; // куда целимся (для стрелки направления)
 	ASoccerPlayer* Receiver = nullptr;
 };
 
@@ -172,10 +173,6 @@ public:
 	float TimeSinceKick() const;
 	float GetLastKickTime() const { return LastKickTime; }
 
-	// Прогноз полёта мяча (та же физика, что в Tick) — для белой линии прицела.
-	void PredictPath(const FVector& Start, const FVector& StartVelocity, const FVector& Curve,
-	                 float CurveTime, TArray<FVector>& OutPoints) const;
-
 	UPROPERTY(VisibleAnywhere) TObjectPtr<USphereComponent> Collision;
 	UPROPERTY(VisibleAnywhere) TObjectPtr<UStaticMeshComponent> Mesh;
 
@@ -242,13 +239,14 @@ public:
 	ASoccerAimLine();
 	virtual void BeginPlay() override;
 
-	void ShowPath(const TArray<FVector>& Points);
+	// Белая стрелка от мяча в направлении паса/удара
+	void ShowArrow(const FVector& From, const FVector& To);
 	void HidePath();
 
 	UPROPERTY(VisibleAnywhere) TObjectPtr<USceneComponent> Root;
 	UPROPERTY(VisibleAnywhere) TArray<TObjectPtr<UStaticMeshComponent>> Segments;
 
-	static constexpr int32 MaxSegments = 48;
+	static constexpr int32 MaxSegments = 3; // древко и два «пера» наконечника
 };
 
 // ============================================================================
@@ -318,13 +316,17 @@ private:
 	void TickFieldAI(float Dt);
 	void TickAIWithBall(float Dt);
 	void TickGoalkeeper(float Dt);
+	void TryKeeperSave();      // вратарь: отбить/поймать мяч в зоне досягаемости
+	void DecideShot();         // вратарь: решить (один раз на удар), возьмёт ли он мяч
+	void KeeperCatch();        // вратарь: поймать мяч в руки
+	void UpdateBodyPose(float Dt); // наклон модели в подкате и в броске вратаря
 	bool TickDash(float Dt);   // рывок/подкат/финт: движение по заданному направлению
 	void TryControlBall();     // подобрать свободный мяч
 	bool ShouldChase() const;  // бежать ли ИИ к мячу
 	FVector FormationPoint() const;
 	void MoveTo(const FVector& Target, float Speed);
 	void FaceTowards(const FVector& Target, float Dt);
-	void StartDash(const FVector& Dir, float Speed, float Time, bool bSlide);
+	void StartDash(const FVector& Dir, float Speed, float Time, bool bSlide, bool bTurn = true);
 	void ExecuteKick(const FSoccerKick& Plan);
 	float SpeedFactor() const;
 	ASoccerPlayer* FindPassTarget(const FVector& AimDir) const;
@@ -342,6 +344,16 @@ private:
 	float GKDecisionKick = -1000.f; // удар, по которому вратарь уже решил, берёт ли он его
 	bool bGKWillSave = false;
 	float GKTackleCooldown = 0.f;
+	float GKHoldTime = 0.f;       // сколько вратарь держит мяч в руках
+	bool bGKDived = false;        // бросок по текущему удару уже сделан
+
+	// Поза тела: подкат (лечь назад) и бросок вратаря (упасть вбок)
+	float SlidePoseTime = 0.f;
+	float DivePoseTime = 0.f;
+	float SlideAlpha = 0.f;
+	float DiveAlpha = 0.f;
+	float DiveSign = 1.f;
+	bool bPoseDirty = false;
 
 	UPROPERTY() TObjectPtr<USkeletalMesh> IdleMesh;
 	UPROPERTY() TObjectPtr<USkeletalMesh> RunMesh;
