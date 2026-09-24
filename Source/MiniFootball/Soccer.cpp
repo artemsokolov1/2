@@ -10,6 +10,9 @@
 #include "Camera/CameraActor.h"
 #include "Camera/CameraComponent.h"
 #include "Engine/StaticMeshActor.h"
+#include "Engine/DirectionalLight.h"
+#include "Components/LightComponent.h"
+#include "EngineUtils.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/LocalPlayer.h"
 #include "Engine/Engine.h"
@@ -1366,6 +1369,7 @@ void ASoccerGameMode::BeginPlay()
 {
 	Super::BeginPlay();
 
+	EnsureLighting();
 	BuildField();
 
 	Ball = GetWorld()->SpawnActor<ASoccerBall>(FVector(0.f, 0.f, BallRadius), FRotator::ZeroRotator);
@@ -1392,6 +1396,28 @@ void ASoccerGameMode::PossessHuman()
 	if (!PC || Players.Num() < 4 || !Camera) return; // поле ещё не построено — повторим из BeginPlay
 	PC->PossessPlayer(Players[3]);
 	PC->SetViewTarget(Camera);
+}
+
+// Если в уровне нет солнца (например, File → New Level → Empty Level) — ставим свет сами:
+// основной источник с тенями и слабый заполняющий с противоположной стороны.
+void ASoccerGameMode::EnsureLighting()
+{
+	if (TActorIterator<ADirectionalLight>(GetWorld()))
+	{
+		return; // в уровне уже есть свет (например, уровень Basic)
+	}
+
+	auto SpawnSun = [this](const FRotator& Rot, float Intensity, bool bShadows)
+	{
+		ADirectionalLight* Sun = GetWorld()->SpawnActor<ADirectionalLight>(FVector(0.f, 0.f, 1000.f), Rot);
+		if (!Sun) return;
+		ULightComponent* Light = Sun->GetLightComponent();
+		Light->SetMobility(EComponentMobility::Movable);
+		Light->SetIntensity(Intensity);
+		Light->SetCastShadows(bShadows);
+	};
+	SpawnSun(FRotator(-50.f, -30.f, 0.f), 8.f, true);
+	SpawnSun(FRotator(-35.f, 150.f, 0.f), 2.f, false);
 }
 
 AStaticMeshActor* ASoccerGameMode::SpawnBox(const FVector& Center, const FVector& Size, const FLinearColor& Color,

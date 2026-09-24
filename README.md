@@ -13,13 +13,80 @@
 - **Логика матча** — гол засчитывается триггером в воротах, когда мяч полностью пересёк линию. Счёт, таймер 60 секунд, сброс позиций через 2 секунды после гола, экран конца матча.
 - **Камера** — почти изометрия сверху (наклон −55°, узкий FOV), плавно следит за мячом.
 
+## Быстрый старт: скачать на диск F: и запустить (Unreal Engine 5.8)
+
+### 1. Что нужно установить (один раз)
+
+1. **Unreal Engine 5.8**: Epic Games Launcher → Unreal Engine → Library → «+» → 5.8.
+2. **Visual Studio 2022 или новее** (подойдёт бесплатная Community). В установщике отметьте рабочую нагрузку **«Разработка игр на C++»** (Game development with C++): вместе с ней ставятся компилятор MSVC и Windows SDK. Без Visual Studio C++ проект не соберётся. Точный список компонентов для вашей версии движка есть в документации Epic: «Setting Up Visual Studio for Unreal Engine».
+3. **Git for Windows**: https://git-scm.com/download/win. Если не хотите ставить Git, используйте вариант с ZIP ниже.
+
+### 2. Скачать проект на диск F:
+
+**Вариант А — через Git.** Откройте «Командную строку» (Win+R → `cmd`) и выполните:
+
+```bat
+git clone -b claude/jolly-sagan-2ec7n4 https://github.com/artemsokolov1/2.git F:\MiniFootball
+```
+
+Позже обновить проект до свежей версии: `cd /d F:\MiniFootball` и `git pull`.
+
+**Вариант Б — ZIP без Git.**
+
+1. Откройте https://github.com/artemsokolov1/2, в выпадающем списке веток выберите `claude/jolly-sagan-2ec7n4`.
+2. Нажмите **Code → Download ZIP**.
+3. Распакуйте архив и переименуйте папку так, чтобы получилось `F:\MiniFootball\MiniFootball.uproject`. Файл `.uproject` должен лежать прямо в `F:\MiniFootball`, а не во вложенной папке.
+
+> Путь должен быть коротким, латиницей и без пробелов: `F:\MiniFootball` подходит, `F:\Мои игры\футбол` — нет.
+
+### 3. Собрать и открыть
+
+1. Дважды кликните `F:\MiniFootball\MiniFootball.uproject`.
+2. Появится окно *«The following modules are missing or built with a different engine version: MiniFootball. Would you like to rebuild them now?»* → нажмите **Yes**. Первая сборка занимает от 1 до 10 минут, окно в это время может «молчать».
+3. Откроется редактор Unreal.
+
+Если сборка не удалась («could not be compiled. Try rebuilding from source manually»), соберите через Visual Studio:
+
+1. Правый клик по `MiniFootball.uproject` → **Generate Visual Studio project files**. В Windows 11: «Показать дополнительные параметры».
+2. Откройте появившийся `MiniFootball.sln`.
+3. Вверху выберите конфигурацию **Development Editor** и платформу **Win64**, затем меню **Build → Build Solution** (Ctrl+Shift+B).
+4. Текст ошибки — в окне *Output* / *Error List*. После успешной сборки нажмите **F5** или снова откройте `.uproject`.
+
+### 4. Запустить матч
+
+1. В редакторе: **File → New Level → Empty Level**.
+2. Нажмите **Play** (зелёный треугольник вверху или Alt+P). Поле, ворота, мяч, 10 игроков, свет и камера создаются сами.
+3. Чтобы уровень открывался сразу:
+   - **File → Save Current Level As** → `Soccer`;
+   - **Edit → Project Settings → Maps & Modes** → *Editor Startup Map* и *Game Default Map* = `Soccer`.
+4. Подключите геймпад Xbox до запуска. DualShock/DualSense на Windows работают через Steam Input или DS4Windows. Можно играть и с клавиатуры, раскладка ниже.
+5. Мышь «захвачена» игрой: **Shift+F1** освобождает курсор, **Esc** останавливает игру.
+
+Режим игры `SoccerGameMode` уже прописан в `Config/DefaultEngine.ini` как режим по умолчанию, поэтому World Settings настраивать не нужно. В уровне **Basic** тоже работает, но из него надо удалить объект `Floor`.
+
+### Если что-то пошло не так
+
+| Проблема | Что делать |
+|----------|------------|
+| При открытии спрашивает выбрать версию движка | Выберите 5.8 (правый клик по `.uproject` → *Switch Unreal Engine version* → 5.8) |
+| «MiniFootball could not be compiled» | Соберите через Visual Studio (см. выше) и пришлите текст первой ошибки из *Error List* |
+| Нет пункта *Generate Visual Studio project files* | Запустите UE 5.8 из Epic Launcher один раз, чтобы он зарегистрировал ярлыки |
+| Нажимаю Play — пусто или темно | Проверьте, что открыт новый *Empty Level*. В логе (*Window → Output Log*) не должно быть ошибок `Soccer` |
+| Геймпад не реагирует | Кликните в окно игры. Для PlayStation-геймпада нужен Steam Input или DS4Windows |
+
+Логи редактора лежат в `F:\MiniFootball\Saved\Logs`.
+
 ## Файлы
 
 | Файл | Что внутри |
 |------|------------|
-| `Source/MiniFootball/Soccer.h` | Объявления всех классов и константы поля |
-| `Source/MiniFootball/Soccer.cpp` | Вся логика: мяч, ворота, игрок и ИИ, контроллер, GameMode |
-| `Source/MiniFootball/MiniFootball.Build.cs` | Зависимость от модуля `EnhancedInput` |
+| `MiniFootball.uproject` | Проект Unreal (движок 5.8, плагин Enhanced Input) |
+| `Config/*.ini` | Режим игры по умолчанию и настройки Enhanced Input |
+| `Source/MiniFootball.Target.cs`, `Source/MiniFootballEditor.Target.cs` | Цели сборки (игра и редактор) |
+| `Source/MiniFootball/MiniFootball.Build.cs` | Модуль и зависимость от `EnhancedInput` |
+| `Source/MiniFootball/MiniFootball.h/.cpp` | Регистрация игрового модуля (шаблонный код) |
+| `Source/MiniFootball/Soccer.h` | **Геймплей:** объявления всех классов и константы поля |
+| `Source/MiniFootball/Soccer.cpp` | **Геймплей:** мяч, ворота, игрок и ИИ, контроллер, GameMode |
 
 Классы:
 
@@ -27,19 +94,7 @@
 - `ASoccerGoal` — ворота и триггер гола.
 - `ASoccerPlayer` — игрок (ACharacter): управление человеком, ИИ полевого и вратаря.
 - `ASoccerPlayerController` — ввод (Enhanced Input создаётся в рантайме, ассеты не нужны), переключение игроков.
-- `ASoccerGameMode` — поле, спавн, счёт, таймер, камера, HUD.
-
-## Пошаговая сборка
-
-1. **Создать проект** → Unreal Engine 5.3+ → Games → Blank → **C++**, имя `MiniFootball`, без стартового контента.
-2. **Положить код** → скопировать `Soccer.h` и `Soccer.cpp` в `Source/MiniFootball/` рядом с `MiniFootball.cpp`.
-3. **Подключить Enhanced Input** → в `Source/MiniFootball/MiniFootball.Build.cs` в `PublicDependencyModuleNames` должен быть `"EnhancedInput"` (готовый файл лежит в репозитории).
-4. **Собрать** → закрыть редактор, в Visual Studio / Rider собрать `MiniFootball Editor` (или правый клик по `.uproject` → Generate project files → Build). Затем открыть редактор.
-5. **Проверить ввод** → Project Settings → Engine → Input → *Default Input Component Class* = `EnhancedInputComponent`, *Default Player Input Class* = `EnhancedPlayerInput`. В UE 5.1+ так стоит по умолчанию.
-6. **Создать уровень** → File → New Level → **Basic** → удалить из уровня `Floor`. Свет и небо оставить. Сохранить как `Soccer`.
-7. **Прикрепить режим игры** → Window → World Settings → *GameMode Override* = `SoccerGameMode`. Блюпринты не нужны: поле, ворота, мяч, игроки и камера создаются сами в `ASoccerGameMode::BeginPlay`.
-8. *(Опционально)* Project Settings → Maps & Modes → *Editor Startup Map* и *Game Default Map* = `Soccer`, *Default GameMode* = `SoccerGameMode`.
-9. **Play** → подключите геймпад Xbox или PlayStation (DualShock/DualSense на Windows — через Steam Input или DS4Windows) либо играйте с клавиатуры.
+- `ASoccerGameMode` — поле, свет, спавн, счёт, таймер, камера, HUD.
 
 Все настройки баланса — константы в коде: размеры поля в `namespace Soccer`, скорости в `ASoccerPlayer`, физика мяча в `ASoccerBall`, камера в `ASoccerGameMode`.
 

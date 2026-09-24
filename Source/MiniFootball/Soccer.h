@@ -308,6 +308,7 @@ public:
 	UPROPERTY() TObjectPtr<ACameraActor> Camera;
 
 private:
+	void EnsureLighting();
 	void BuildField();
 	AStaticMeshActor* SpawnBox(const FVector& Center, const FVector& Size, const FLinearColor& Color,
 	                           bool bCollide, float Yaw = 0.f);
