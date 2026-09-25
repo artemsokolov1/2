@@ -20,3 +20,6 @@ Build/
 # импортированные .uasset в репозиторий не кладём (их легко пересоздать, а весят они много)
 Content/Characters/Footballer/*
 !Content/Characters/Footballer/.gitkeep
+
+# Текстуры, которые Blender извлекает из FBX
+SourceArt/**/*.fbm/

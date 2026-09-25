@@ -679,6 +679,11 @@ void ASoccerPlayer::Setup(int32 InTeam, bool bInGoalkeeper, const FVector& InHom
 	Info = InInfo;
 	RosterIndex = InRosterIndex;
 	ShirtColor = Shirt;
+	// Внешность: у своих игроков — из сохранения; у кого рецепта нет — стабильно по имени
+	if (!Info.Look.IsSet())
+	{
+		Info.Look = FSoccerLook::Random(int32(GetTypeHash(Info.Name)) | 1, Info.Pace, Info.Physical);
+	}
 
 	static const FLinearColor Skins[3] = {
 		FLinearColor(0.8f, 0.55f, 0.4f), FLinearColor(0.55f, 0.35f, 0.22f), FLinearColor(0.9f, 0.7f, 0.55f)
@@ -709,7 +714,10 @@ void ASoccerPlayer::ApplyCharacterModel(USkeletalMesh* InIdleMesh, UAnimSequence
 	SkelMesh->SetSkeletalMeshAsset(IdleMesh);
 	SkelMesh->SetRelativeLocationAndRotation(FVector(0.f, 0.f, -GetCapsuleComponent()->GetUnscaledCapsuleHalfHeight()),
 	                                         FRotator(0.f, MeshYawOffset, 0.f));
-	SkelMesh->SetAnimationMode(EAnimationMode::AnimationSingleNode);
+	// Свой AnimInstance: проигрывает анимацию как Single Node и масштабирует кости (голова, полнота)
+	SkelMesh->SetAnimationMode(EAnimationMode::AnimationBlueprint);
+	SkelMesh->SetAnimInstanceClass(USoccerAnimInstance::StaticClass());
+	SoccerLook::Apply(SkelMesh, Info.Look);
 
 	// Капсулу прячем, вместо формы — круг цвета команды под ногами
 	Body->SetVisibility(false);
@@ -741,10 +749,13 @@ void ASoccerPlayer::UpdateAnimation()
 		if (WantMesh && SkelMesh->GetSkeletalMeshAsset() != WantMesh)
 		{
 			SkelMesh->SetSkeletalMeshAsset(WantMesh);
+			SoccerLook::Apply(SkelMesh, Info.Look); // смена меша сбрасывает морфы и AnimInstance
 		}
 		if (Want)
 		{
-			SkelMesh->PlayAnimation(Want, true);
+			// Не PlayAnimation: он переключил бы меш на стандартный Single Node без масштаба костей
+			SkelMesh->SetAnimation(Want);
+			SkelMesh->Play(true);
 		}
 		else
 		{
@@ -3382,6 +3393,7 @@ FSoccerPlayerInfo ASoccerGameMode::MakeRandomPlayer(const FString& Position, int
 	{
 		I.Pace = Roll(6); I.Shooting = Roll(5); I.Passing = Roll(0); I.Dribbling = Roll(5); I.Defending = Roll(-25); I.Physical = Roll(-5);
 	}
+	I.Look = FSoccerLook::Random(FMath::Rand() | 1, I.Pace, I.Physical);
 	return I;
 }
 

@@ -24,6 +24,7 @@
 #include "GameFramework/HUD.h"
 #include "GameFramework/SaveGame.h"
 #include "SoccerAudio.h"
+#include "SoccerLook.h"
 #include "Soccer.generated.h"
 
 class USoundWaveProcedural;
@@ -148,6 +149,7 @@ struct FSoccerPlayerInfo
 	UPROPERTY() int32 Dribbling = 70; // ДРБ — дриблинг
 	UPROPERTY() int32 Defending = 70; // ЗАЩ — защита
 	UPROPERTY() int32 Physical = 70;  // ФИЗ — физика
+	UPROPERTY() FSoccerLook Look;      // внешность (нос, глаза, полнота...), см. SoccerLook.h
 
 	int32 Rating() const;
 	int32& Stat(int32 Index);         // 0..5 в порядке СКР УДР ПАС ДРБ ЗАЩ ФИЗ
