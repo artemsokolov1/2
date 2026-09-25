@@ -43,7 +43,7 @@ namespace SoccerLook
 		TEXT("MF_Nose"), TEXT("MF_NoseLong"), TEXT("MF_Eyes"), TEXT("MF_Cheeks"),
 		TEXT("MF_Ears"), TEXT("MF_Belly"), TEXT("MF_Neck")
 	};
-	const FName MorphVersionTag = TEXT("MF_Version_2");
+	const FName MorphVersionTag = TEXT("MF_Version_3");
 
 	// Мягкий купол: 1 в центре, 0 на радиусе Rad и дальше
 	static float Falloff(float Dist, float Rad)
@@ -110,8 +110,9 @@ namespace SoccerLook
 			if (Rad > 26.f || Rad < 0.01f) break;
 			const FVector3f Dir = H / Rad;
 			const float Front = FMath::Max(0.f, FVector3f::DotProduct(Dir, Fwd));
-			const float Height = FMath::Exp(-FMath::Square((P.Z - 110.f) / 19.f));
-			D = Dir * Height * (7.f + 10.f * Front * Front) * FMath::Pow(Falloff(Rad, 27.f), 0.3f);
+			const float Height = FMath::Exp(-FMath::Square((P.Z - 108.f) / 22.f));
+			// Бока — умеренно (руки висят рядом), вперёд — пузо
+			D = Dir * Height * (8.f + 20.f * Front * Front) * FMath::Pow(Falloff(Rad, 27.f), 0.3f);
 			break;
 		}
 		case 6: // толстая шея

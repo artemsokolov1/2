@@ -22,6 +22,8 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Engine/SkeletalMesh.h"
 #include "FileHelpers.h"
+#include "Materials/Material.h"
+#include "Materials/MaterialInstanceConstant.h"
 #include "MeshDescription.h"
 #include "SkeletalMeshAttributes.h"
 #include "SoccerLook.h"
@@ -95,6 +97,50 @@ private:
 		}
 	}
 
+	// Материалам модели нужен флаг «Used with Morph Targets», иначе в игре будет серый материал
+	// по умолчанию. Импорт FBX делает инстансы материалов движка (/InterchangeAssets), которые менять
+	// нельзя, поэтому базовый материал копируется в проект, и инстанс переключается на копию.
+	static void EnableMorphMaterials(USkeletalMesh* SkelMesh, TArray<UPackage*>& ToSave)
+	{
+		for (const FSkeletalMaterial& Slot : SkelMesh->GetMaterials())
+		{
+			UMaterialInstanceConstant* Instance = Cast<UMaterialInstanceConstant>(Slot.MaterialInterface);
+			UMaterial* Base = Slot.MaterialInterface ? Slot.MaterialInterface->GetMaterial() : nullptr;
+			if (!Base || Base->GetUsageByFlag(MATUSAGE_MorphTargets)) continue;
+
+			UMaterial* Target = Base;
+			if (!Base->GetPathName().StartsWith(TEXT("/Game/")))
+			{
+				if (!Instance) continue;
+				const FString CopyName = TEXT("M_") + Base->GetName();
+				const FString CopyPath = TEXT("/Game/Characters/Footballer/Materials");
+				Target = LoadObject<UMaterial>(nullptr, *(CopyPath / CopyName + TEXT(".") + CopyName), nullptr, LOAD_NoWarn | LOAD_Quiet);
+				if (!Target)
+				{
+					IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
+					Target = Cast<UMaterial>(AssetTools.DuplicateAsset(CopyName, CopyPath, Base));
+				}
+				if (!Target) continue;
+			}
+			if (!Target->GetUsageByFlag(MATUSAGE_MorphTargets) || !Target->GetUsageByFlag(MATUSAGE_SkeletalMesh))
+			{
+				Target->SetUsageByFlag(MATUSAGE_MorphTargets, true);
+				Target->SetUsageByFlag(MATUSAGE_SkeletalMesh, true);
+				Target->PostEditChange();
+				Target->MarkPackageDirty();
+				ToSave.AddUnique(Target->GetPackage());
+			}
+			if (Instance && Instance->Parent != Target)
+			{
+				Instance->SetParentEditorOnly(Target);
+				Instance->PostEditChange();
+				Instance->MarkPackageDirty();
+				ToSave.AddUnique(Instance->GetPackage());
+			}
+			UE_LOG(LogTemp, Log, TEXT("MiniFootball: материал %s — включены морф-таргеты"), *Slot.MaterialInterface->GetName());
+		}
+	}
+
 	// Морф-таргеты карикатуры: пишем смещения вершин в MeshDescription и пересобираем меш
 	static void BuildCaricatureMorphs()
 	{
@@ -109,6 +155,8 @@ private:
 			USkeletalMesh* SkelMesh = Cast<USkeletalMesh>(Data.GetAsset());
 			FMeshDescription* Desc = SkelMesh ? SkelMesh->GetMeshDescription(0) : nullptr;
 			if (!Desc) continue;
+
+			EnableMorphMaterials(SkelMesh, ToSave);
 
 			FSkeletalMeshAttributes Attributes(*Desc);
 			if (Attributes.GetMorphTargetNames().Contains(SoccerLook::MorphVersionTag))
