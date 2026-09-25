@@ -197,10 +197,8 @@ public:
 
 	// Удар: мяч освобождается и получает скорость и вращение (верхнее/нижнее/боковое).
 	void Kick(ASoccerPlayer* Kicker, const FVector& NewVelocity, const FVector& NewSpin = FVector::ZeroVector);
-	// Касание при ведении: мяч катится по газону с заданной скоростью (владелец не меняется).
+	// Толчок мяча по газону с заданной скоростью (владелец не меняется).
 	void Touch(const FVector& NewVelocity);
-	// Придержать мяч у ног (игрок с мячом стоит на месте).
-	void HoldAt(const FVector& Spot, float Dt);
 
 	// Назначить игрока, который ведёт мяч (nullptr — мяч свободен).
 	void SetOwnerPlayer(ASoccerPlayer* NewOwner);
@@ -353,6 +351,7 @@ public:
 	bool TeamHasBall() const;
 	bool CanKickBall() const;   // мяч в зоне удара ногой (у ног или рядом, в т.ч. с лёта)
 	bool CanHeadBall() const;   // мяч в воздухе рядом — можно сыграть головой
+	FVector GetDribbleSpot() const; // где держится мяч при ведении (у ног, перед игроком)
 	float GetStamina() const { return Stamina; }
 	bool IsShielding() const { return bShielding; }
 	float AttackSign() const { return Team == 0 ? 1.f : -1.f; }
@@ -387,8 +386,11 @@ private:
 	void KeeperCatch();        // вратарь: поймать мяч в руки
 	void UpdateBodyPose(float Dt); // наклон модели в подкате и в броске вратаря
 	bool TickDash(float Dt);   // рывок/подкат/финт: движение по заданному направлению
-	void TryControlBall();     // приём мяча (первое касание) и перехват между касаниями соперника
-	void TickDribble(float Dt);        // ведение касаниями: мяч толкается вперёд, между касаниями свободен
+	void TryControlBall();     // приём мяча (первое касание)
+	void TickDribble(float Dt);        // ведение: ритм касаний (мяч держится у ног, см. GetDribbleSpot)
+	void TickHumanKeeper(float Dt);    // ваш вратарь с мячом в руках: вы выбираете, куда отдать пас
+	void KeeperDistribute();           // вратарь сам вводит мяч в игру
+	void HandOverFromKeeper();         // после паса вратаря управление переходит к полевому игроку
 	bool TickPendingKick(float Dt);    // добежать до мяча и выполнить отложенный удар
 	void UpdateLocomotion(float Dt);   // инерция: разгон, торможение, радиус поворота, выносливость
 	float SprintSpeedNow() const;      // скорость спринта с учётом усталости
@@ -425,6 +427,7 @@ private:
 	float Stamina = 1.f;          // выносливость 0..1: спринт тратит, шаг восстанавливает
 	float TouchCooldown = 0.f;
 	float ControlCooldown = 0.f;
+	float DribblePhase = 0.f;     // ритм «касаний» при ведении (мяч чуть отходит от ноги и возвращается)
 	bool bSlideResolved = false;  // подкат уже выбил мяч или сфолил
 
 	// Отложенный удар (мяч впереди, игрок добегает до него)
