@@ -43,7 +43,7 @@ namespace SoccerLook
 		TEXT("MF_Nose"), TEXT("MF_NoseLong"), TEXT("MF_Eyes"), TEXT("MF_Cheeks"),
 		TEXT("MF_Ears"), TEXT("MF_Belly"), TEXT("MF_Neck")
 	};
-	const FName MorphVersionTag = TEXT("MF_Version_1");
+	const FName MorphVersionTag = TEXT("MF_Version_2");
 
 	// Мягкий купол: 1 в центре, 0 на радиусе Rad и дальше
 	static float Falloff(float Dist, float Rad)
