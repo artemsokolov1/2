@@ -2,14 +2,16 @@
 // Все классы игры объявлены в одном заголовке. Реализация:
 //   Soccer.cpp   — мяч, ворота, игроки и ИИ, управление, режим игры, сохранения
 //   SoccerUI.cpp — интерфейс на Slate: главное меню, HUD матча, пауза
+//   SoccerAudio  — звуки, синтезированные в коде (свисток, удары, трибуны)
 //
 //  ASoccerBall             — мяч: гравитация, сопротивление воздуха, вращение (Магнус), отскоки, штанги, столкновения с игроками
 //  ASoccerGoal             — ворота: штанги, сетка и триггер гола
 //  ASoccerAimLine          — белая линия «куда полетит мяч» при замахе
 //  ASoccerPlayer           — игрок-капсула: управление человеком, ИИ полевого и вратаря
 //  ASoccerPlayerController — геймпад/клавиатура (схема FIFA), переключение игроков, замах с силой
-//  ASoccerHUD              — шкала силы удара и выносливость под игроком
-//  ASoccerGameMode         — поле, стадион, меню ↔ матч, счёт, таймер, камера, награды
+//  ASoccerHUD              — шкала силы удара и выносливость под игроком, радар
+//  ASoccerGameMode         — поле, стадион, меню ↔ матч, счёт, таймер, камера, награды,
+//                            роли ИИ команд, стандарты, статистика матча, звук
 //  USoccerSave             — прогресс: монеты, состав, форма, испытания, настройки
 
 #pragma once
@@ -21,8 +23,11 @@
 #include "GameFramework/GameModeBase.h"
 #include "GameFramework/HUD.h"
 #include "GameFramework/SaveGame.h"
+#include "SoccerAudio.h"
 #include "Soccer.generated.h"
 
+class USoundWaveProcedural;
+class UAudioComponent;
 class USphereComponent;
 class UBoxComponent;
 class UStaticMeshComponent;
@@ -77,6 +82,37 @@ enum class ESoccerMode : uint8
 
 // Что сейчас «заряжает» человек (зажатая кнопка удара/паса)
 enum class ECharge : uint8 { None, Pass, Through, Lob, Shot };
+
+// Возобновление игры: пока мяч не введён, соперники исполнителя держат дистанцию
+enum class ESoccerRestart : uint8
+{
+	None,
+	Kickoff,  // с центра поля (соперники — за центральным кругом)
+	FreeKick, // штрафной (соперники — не ближе 5 м, у ворот — стенка)
+	Penalty   // пенальти (все, кроме бьющего и вратарей, — за штрафной)
+};
+
+// Роль ИИ полевого игрока (раздаёт ASoccerGameMode::UpdateTeamAI)
+enum class ESoccerAIRole : uint8
+{
+	Support, // своя команда с мячом — открываться; иначе — держать позицию
+	Chase,   // бежать на мяч / на перехват
+	Press,   // прессинг владельца мяча
+	Cover,   // страховка между мячом и своими воротами
+	Mark     // персональная опека соперника
+};
+
+// Статистика команды за матч
+struct FSoccerMatchStats
+{
+	float Possession = 0.f;   // секунды владения мячом
+	int32 Shots = 0;
+	int32 ShotsOnTarget = 0;
+	int32 Passes = 0;
+	int32 PassesCompleted = 0;
+	int32 Saves = 0;
+	int32 Fouls = 0;
+};
 
 // Игровая форма из магазина
 struct FSoccerKit
@@ -136,6 +172,7 @@ public:
 	UPROPERTY() int32 StarterIndex = 3;            // кем управляем в начале матча
 	UPROPERTY() int32 MatchMinutes = 1;            // длительность матча, минуты
 	UPROPERTY() int32 Difficulty = 1;              // 0 — лёгкая, 1 — нормальная, 2 — сложная
+	UPROPERTY() int32 SoundVolume = 8;             // громкость звука 0..10
 	UPROPERTY() int32 MatchesPlayed = 0;
 	UPROPERTY() int32 Wins = 0;
 	UPROPERTY() int32 GoalsScored = 0;
@@ -175,6 +212,15 @@ public:
 	float TimeSinceKick() const;
 	float GetLastKickTime() const { return LastKickTime; }
 
+	// Где будет мяч через T секунд (по газону — с трением; для перехватов и приёма у ИИ).
+	FVector PredictLocation(float T) const;
+
+	// Во что мяч ударился за шаг физики (для звуков и реакции трибун)
+	static constexpr int32 HitPost = 1;      // штанга или перекладина
+	static constexpr int32 HitBoard = 2;     // боковой борт
+	static constexpr int32 HitEndBoard = 4;  // борт за линией ворот (мимо ворот или выше)
+	static constexpr int32 HitNet = 8;       // сетка ворот
+
 	UPROPERTY(VisibleAnywhere) TObjectPtr<USphereComponent> Collision;
 	UPROPERTY(VisibleAnywhere) TObjectPtr<UStaticMeshComponent> Mesh;
 
@@ -199,9 +245,10 @@ public:
 
 private:
 	// Один шаг физики: гравитация, сопротивление, Магнус, трение, отскоки, борта, ворота.
-	void Integrate(FVector& P, FVector& V, FVector& W, float Dt) const;
+	// Возвращает флаги Hit* — во что ударился мяч.
+	int32 Integrate(FVector& P, FVector& V, FVector& W, float Dt) const;
 	// Борта вокруг поля и ворота: внутрь только через створ, круглые штанги и перекладина, сетка.
-	void CollideWithWalls(FVector& P, const FVector& OldP, FVector& V) const;
+	int32 CollideWithWalls(FVector& P, const FVector& OldP, FVector& V) const;
 	// Мяч отскакивает от корпуса и ног игроков (кроме того, кто ведёт мяч).
 	void CollideWithPlayers(FVector& P);
 
@@ -295,6 +342,12 @@ public:
 	void Stun(float Seconds);               // игрок «сбит»: теряет мяч и управление
 	void GainBall();                        // забрать мяч себе
 
+	// ---------- ИИ ----------
+	void SetAIRole(ESoccerAIRole InRole, ASoccerPlayer* InMark = nullptr);
+	void PrepareRestart(float Delay);       // исполнитель стандарта: пауза перед розыгрышем
+	// Через сколько секунд игрок успеет к мячу (99 — не успеет) и где встретит его.
+	float InterceptTime(FVector& OutPoint) const;
+
 	// ---------- Состояние ----------
 	bool HasBall() const;
 	bool TeamHasBall() const;
@@ -342,8 +395,20 @@ private:
 	float KickErrorDegrees(int32 Skill, float Power01, const FVector& Dir, bool bFirstTime) const;
 	void QueueKick(ECharge Kind, const FVector& AimDir, float Power01, bool bFinesse, bool bChip);
 	void ExecuteQueued();
-	bool ShouldChase() const;  // бежать ли ИИ к мячу
 	FVector FormationPoint() const;
+	// ---------- ИИ полевого игрока ----------
+	int32 AILevel() const;                     // 0..2: сложность для соперника, «нормально» для партнёров
+	void TickPress(float Dt);                  // прессинг владельца: сдерживание и отбор в удачный момент
+	void TickRestartHold(float Dt);            // стандарт у соперника: держать дистанцию
+	FVector ComputeSupportPoint() const;       // куда открыться под пас
+	bool DecideWithBall(int32 Level);          // удар / пас / продолжить ведение
+	void TakeRestart();                        // ИИ разыгрывает стандарт
+	float EvaluateShot(float& OutAimFrac, float& OutPower, bool& bOutFinesse) const;
+	float EvaluatePass(const ASoccerPlayer* Mate, EPassKind Kind, FVector& OutTarget) const;
+	bool FindBestPass(EPassKind& OutKind, FVector& OutTarget, float& OutScore) const;
+	FVector DribbleDirection() const;          // к воротам, огибая соперников
+	float SpaceAhead() const;                  // сколько свободного места впереди (до соперника)
+	FVector ShotAimDir(float AimFrac) const;   // направление «стика» для удара в точку створа (−1..1)
 	void MoveTo(const FVector& Target, float Speed);
 	void FaceTowards(const FVector& Target, float Dt);
 	void StartDash(const FVector& Dir, float Speed, float Time, bool bSlide, bool bTurn = true);
@@ -375,6 +440,12 @@ private:
 	float TackleCooldown = 0.f;
 	float SkillCooldown = 0.f;
 	float AIDecisionTimer = 0.f;
+
+	// Роль ИИ и точка открывания
+	ESoccerAIRole AIRole = ESoccerAIRole::Support;
+	TWeakObjectPtr<ASoccerPlayer> MarkTarget;
+	FVector SupportPoint = FVector::ZeroVector;
+	float SupportTimer = 0.f;
 	float GKReactionTimer = 0.f;
 	float GKTargetY = 0.f;
 	float GKDecisionKick = -1000.f; // удар, по которому вратарь уже решил, берёт ли он его
@@ -500,6 +571,10 @@ class ASoccerHUD : public AHUD
 
 public:
 	virtual void DrawHUD() override;
+
+private:
+	// Радар (мини-карта поля) внизу по центру: игроки цветом формы, мяч — белая точка
+	void DrawRadar(const ASoccerGameMode* G);
 };
 
 // ============================================================================
@@ -535,6 +610,23 @@ public:
 	void OnGoalScored(int32 ScoringTeam);
 	void OnHumanPass();
 	void OnFoul(ASoccerPlayer* Offender, ASoccerPlayer* Victim); // фол: штрафной или пенальти
+	// Для статистики и звука
+	void OnShot(ASoccerPlayer* Shooter);
+	void OnPassMade(ASoccerPlayer* Passer);
+	void OnBallGained(ASoccerPlayer* Receiver);
+	void OnKeeperSave(ASoccerPlayer* Keeper);
+	void OnBallImpact(int32 HitFlags, const FVector& Where, float Speed); // штанга, борт, сетка
+	void PlaySfx(ESoccerSound Sound, float Gain = 1.f);
+
+	// ---------- Стандарты ----------
+	ESoccerRestart GetRestart() const { return Restart; }
+	bool IsRestartTaker(const ASoccerPlayer* P) const;
+	bool MustKeepDistance(const ASoccerPlayer* P) const; // стоять ли игроку в стороне от мяча
+	float GetRestartRadius() const;
+
+	// ---------- Статистика ----------
+	const FSoccerMatchStats& GetStats(int32 InTeam) const { return Stats[InTeam]; }
+	int32 GetPossessionPercent(int32 InTeam) const;
 
 	// ---------- Данные для HUD и ИИ ----------
 	bool IsPlayActive() const { return bPlayActive; }
@@ -552,8 +644,7 @@ public:
 	ASoccerPlayer* GetTeamPlayer(int32 InTeam, int32 Index) const;
 	ASoccerPlayer* GetHumanPlayer() const;
 	ASoccerPlayer* GetFocusOpponent() const;
-	// Ближайший к мячу полевой игрок команды (bOnlyAI — пропускать игрока человека).
-	ASoccerPlayer* NearestToBall(int32 InTeam, bool bOnlyAI) const;
+	ASoccerPlayer* GetGoalkeeper(int32 InTeam) const;
 	float GetCameraYaw() const { return CameraYaw; }
 
 	UPROPERTY() TObjectPtr<ASoccerBall> Ball;
@@ -576,6 +667,11 @@ private:
 	void PossessHuman();
 	void ResetPositions();
 	void StartSetPiece();
+	void BeginRestart(ESoccerRestart Kind, ASoccerPlayer* Taker, const FVector& Spot);
+	void UpdateTeamAI();
+	void InitAudio();
+	void PumpAudio(float Dt);
+	void PlayOoh(float Gain);
 	void EndMatch();
 	void UpdateCamera(float Dt);
 	void ShowWidget(TSharedPtr<SWidget>& Holder, const TSharedRef<SWidget>& Widget, int32 ZOrder);
@@ -607,6 +703,27 @@ private:
 	TWeakObjectPtr<ASoccerPlayer> SetPieceTaker;
 	FVector SetPieceSpot = FVector::ZeroVector;
 	bool bPenalty = false;
+	// Возобновление игры (разводка / штрафной / пенальти), пока мяч не введён
+	ESoccerRestart Restart = ESoccerRestart::None;
+	TWeakObjectPtr<ASoccerPlayer> RestartTaker;
+	float RestartStartTime = 0.f;
+	int32 KickoffTeam = 0;        // кто разводит с центра (пропустившая гол команда)
+	float TeamAITimer = 0.f;
+
+	// Статистика матча
+	FSoccerMatchStats Stats[2];
+	int32 PossessionTeam = -1;
+	TWeakObjectPtr<ASoccerPlayer> PendingPasser; // пас в пути: засчитать точным, если примет партнёр
+	bool bShotPending = false;                   // удар в пути: в створ, если гол или сейв
+	int32 PendingShotTeam = 0;
+	float PendingShotTime = 0.f;
+
+	// Звук: один бесконечный процедурный звук, который наполняет микшер FSoccerAudio
+	UPROPERTY() TObjectPtr<USoundWaveProcedural> SoundWave;
+	UPROPERTY() TObjectPtr<UAudioComponent> SoundComp;
+	FSoccerAudio Audio;
+	TArray<int16> AudioBuffer;
+	float OohCooldown = 0.f;
 	float MenuTime = 0.f;
 	bool bInMatch = false;
 	bool bPlayActive = false;

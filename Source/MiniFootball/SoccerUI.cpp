@@ -291,6 +291,87 @@ TSharedRef<SButton> SettingRow(const FText& Title, const FText& Value, const TFu
 	});
 }
 
+// Статистика матча: строки «наши | показатель | соперник»
+FString StatValue(const ASoccerGameMode& M, int32 Row, int32 Team)
+{
+	const FSoccerMatchStats& S = M.GetStats(Team);
+	switch (Row)
+	{
+	case 0:  return FString::Printf(TEXT("%d%%"), M.GetPossessionPercent(Team));
+	case 1:  return FString::FromInt(S.Shots);
+	case 2:  return FString::FromInt(S.ShotsOnTarget);
+	case 3:  return FString::Printf(TEXT("%d / %d"), S.PassesCompleted, S.Passes);
+	case 4:  return FString::FromInt(S.Saves);
+	default: return FString::FromInt(S.Fouls);
+	}
+}
+
+TSharedRef<SWidget> StatsTable(const TWeakObjectPtr<ASoccerGameMode>& G, float FontSize)
+{
+	static const TCHAR* Labels[6] = {
+		TEXT("Владение мячом"), TEXT("Удары"), TEXT("Удары в створ"), TEXT("Точные пасы"), TEXT("Сейвы вратаря"), TEXT("Фолы")
+	};
+	auto Cell = [G](int32 Row, int32 Team)
+	{
+		return [G, Row, Team]() { return G.IsValid() ? FText::FromString(StatValue(*G.Get(), Row, Team)) : FText::GetEmpty(); };
+	};
+	const FText Home = G.IsValid() ? FText::FromString(G->GetTeamName(0)).ToUpper() : FText::GetEmpty();
+	const FText Away = G.IsValid() ? FText::FromString(G->GetTeamName(1)).ToUpper() : FText::GetEmpty();
+
+	TSharedRef<SVerticalBox> Box = SNew(SVerticalBox)
+		+ SVerticalBox::Slot().AutoHeight().Padding(0.f, 0.f, 0.f, 6.f)
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().AutoWidth()
+			[
+				SNew(SBox).WidthOverride(170.f).HAlign(HAlign_Right)
+				[
+					Txt(Home, FontBold(FontSize - 4.f), ColLime())
+				]
+			]
+			+ SHorizontalBox::Slot().AutoWidth()
+			[
+				SNew(SBox).WidthOverride(260.f)
+			]
+			+ SHorizontalBox::Slot().AutoWidth()
+			[
+				SNew(SBox).WidthOverride(170.f).HAlign(HAlign_Left)
+				[
+					Txt(Away, FontBold(FontSize - 4.f), ColLime())
+				]
+			]
+		];
+	for (int32 Row = 0; Row < 6; ++Row)
+	{
+		Box->AddSlot().AutoHeight().Padding(0.f, 2.f)
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().AutoWidth()
+			[
+				SNew(SBox).WidthOverride(170.f).HAlign(HAlign_Right)
+				[
+					SNew(STextBlock).Font(FontBold(FontSize)).ColorAndOpacity(FLinearColor::White).Text_Lambda(Cell(Row, 0))
+				]
+			]
+			+ SHorizontalBox::Slot().AutoWidth()
+			[
+				SNew(SBox).WidthOverride(260.f).HAlign(HAlign_Center)
+				[
+					Txt(Ru(Labels[Row]), FontRegular(FontSize - 2.f), ColGray())
+				]
+			]
+			+ SHorizontalBox::Slot().AutoWidth()
+			[
+				SNew(SBox).WidthOverride(170.f).HAlign(HAlign_Left)
+				[
+					SNew(STextBlock).Font(FontBold(FontSize)).ColorAndOpacity(FLinearColor::White).Text_Lambda(Cell(Row, 1))
+				]
+			]
+		];
+	}
+	return Box;
+}
+
 // ============================================================================
 //  Данные меню: испытания, тренировки, друзья
 // ============================================================================
@@ -1342,6 +1423,19 @@ TSharedRef<SWidget> SSoccerMenu::BuildSettings()
 				Refresh();
 			})
 		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(0.f, 0.f, 0.f, 6.f)
+		[
+			SettingRow(Ru(TEXT("Громкость звука")),
+			           FText::FromString(S->SoundVolume > 0 ? FString::Printf(TEXT("%d%%"), S->SoundVolume * 10) : FString(TEXT("выкл."))),
+			           [this]()
+			{
+				USoccerSave* Sv = GetSave();
+				if (!Sv) return;
+				Sv->SoundVolume = (Sv->SoundVolume / 2 * 2 + 2) % 12; // 0, 20, 40, 60, 80, 100 %
+				Persist(false);
+				Refresh();
+			})
+		]
 		+ SVerticalBox::Slot().AutoHeight().Padding(0.f, 0.f, 0.f, 24.f)
 		[
 			SettingRow(Ru(TEXT("Сбросить прогресс")),
@@ -1427,9 +1521,13 @@ void SSoccerPause::Construct(const FArguments& InArgs)
 				[
 					Txt(Ru(TEXT("ПАУЗА")), FontBold(64), ColLime())
 				]
-				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(0.f, 6.f, 0.f, 26.f)
+				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(0.f, 6.f, 0.f, 18.f)
 				[
 					Txt(ScoreLine, FontRegular(22), ColGray())
+				]
+				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(0.f, 0.f, 0.f, 22.f)
+				[
+					StatsTable(G, 18.f)
 				]
 				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
 				[
@@ -1728,6 +1826,10 @@ TSharedRef<SWidget> Banner(const TWeakObjectPtr<ASoccerGameMode>& G)
 					SNew(STextBlock).Font(FontBold(48)).ColorAndOpacity(ColLime())
 					.Text_Lambda([G]() { return G.IsValid() ? G->GetResultText() : FText::GetEmpty(); })
 				]
+				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(0.f, 8.f, 0.f, 16.f)
+				[
+					StatsTable(G, 20.f)
+				]
 				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
 				[
 					Txt(Ru(TEXT("Возвращаемся в главное меню...")), FontRegular(20), ColGray())
@@ -1792,7 +1894,7 @@ TSharedRef<SWidget> SoccerUI::MakeHud(ASoccerGameMode* GameMode)
 		]
 		+ SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Bottom).Padding(0.f, 0.f, 0.f, 12.f)
 		[
-			Txt(Ru(TEXT("Зажмите пас или удар — белая линия покажет полёт мяча   ·   Start / P — пауза")),
+			Txt(Ru(TEXT("Зажмите пас или удар — стрелка покажет направление   ·   Start / P — пауза и статистика")),
 			    FontRegular(15), FLinearColor(1.f, 1.f, 1.f, 0.55f))
 		];
 }
