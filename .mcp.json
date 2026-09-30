@@ -16,6 +16,10 @@
         "@runreal/unreal-mcp"
       ],
       "env": {}
+    },
+    "unreal-epic": {
+      "type": "http",
+      "url": "http://localhost:8000/mcp"
     }
   }
 }

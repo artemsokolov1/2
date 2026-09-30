@@ -70,30 +70,28 @@ void FSoccerAudio::Init()
 	Rng.Initialize(20240917);
 	auto Clip = [this](ESoccerSound Sound) -> TArray<float>& { return Clips[(int32)Sound]; };
 
-	// Удар: глухой «пум» — тон с падающей частотой и короткий щелчок
+	// Удар, as recorded in Goals: a dull boom, 80-90% of the energy at 80-320 Hz and almost
+	// nothing above 640 Hz; full level for ~10 ms, then -25 dB within 40 ms.
+	auto Boom = [this](TArray<float>& A, float Seconds, float F0, float Hold, float Decay)
 	{
-		TArray<float>& A = Clip(ESoccerSound::Kick);
-		A.SetNumZeroed(NumSamples(0.16f));
-		float Phase = 0.f;
+		A.SetNumZeroed(NumSamples(Seconds));
+		float Phase = 0.f, Lp1 = 0.f, Lp2 = 0.f;
 		for (int32 i = 0; i < A.Num(); ++i)
 		{
 			const float T = i / SR;
-			Phase += TwoPi * (65.f + 120.f * FMath::Exp(-T * 40.f)) / SR;
-			A[i] = FMath::Sin(Phase) * FMath::Exp(-T * 30.f) + Rng.FRandRange(-1.f, 1.f) * 0.5f * FMath::Exp(-T * 350.f);
+			Phase += TwoPi * (F0 + 90.f * FMath::Exp(-T * 60.f)) / SR;
+			// the leather slap: noise kept under ~600 Hz by two low-pass stages
+			Lp1 += (Rng.FRandRange(-1.f, 1.f) - Lp1) * 0.16f;
+			Lp2 += (Lp1 - Lp2) * 0.16f;
+			const float Env = FMath::Min(1.f, T / 0.0015f) * (T < Hold ? 1.f : FMath::Exp(-(T - Hold) * Decay));
+			// + a short leather "crack" (2-3 kHz) so the strike cuts through on small speakers
+			const float Crack = Rng.FRandRange(-1.f, 1.f) * FMath::Sin(TwoPi * 2400.f * T) * FMath::Exp(-T * 500.f);
+			A[i] = (FMath::Sin(Phase) + 0.45f * FMath::Sin(2.f * Phase) + Lp2 * 3.f) * Env + 0.9f * Crack;
 		}
-	}
-	// Касание: короче и выше
-	{
-		TArray<float>& A = Clip(ESoccerSound::Touch);
-		A.SetNumZeroed(NumSamples(0.08f));
-		float Phase = 0.f;
-		for (int32 i = 0; i < A.Num(); ++i)
-		{
-			const float T = i / SR;
-			Phase += TwoPi * (110.f + 160.f * FMath::Exp(-T * 60.f)) / SR;
-			A[i] = FMath::Sin(Phase) * FMath::Exp(-T * 55.f) + Rng.FRandRange(-1.f, 1.f) * 0.35f * FMath::Exp(-T * 400.f);
-		}
-	}
+	};
+	Boom(Clip(ESoccerSound::Kick), 0.14f, 120.f, 0.010f, 70.f);
+	// Касание: the same boom, shorter (8-10 dB quieter by its gain)
+	Boom(Clip(ESoccerSound::Touch), 0.08f, 140.f, 0.006f, 95.f);
 	// Свистки
 	AddWhistle(Clip(ESoccerSound::Whistle), 0.f, 0.4f, Rng);
 	AddWhistle(Clip(ESoccerSound::WhistleLong), 0.f, 1.1f, Rng);
@@ -119,17 +117,19 @@ void FSoccerAudio::Init()
 			A[i] = S;
 		}
 	}
-	// Сетка: шуршащий всплеск шума
+	// Сетка, as recorded in Goals: a soft low rustle (most energy under 640 Hz), ~350 ms
 	{
 		TArray<float>& A = Clip(ESoccerSound::Net);
-		A.SetNumZeroed(NumSamples(0.4f));
-		float L1 = 0.f, L2 = 0.f;
+		A.SetNumZeroed(NumSamples(0.45f));
+		float L1 = 0.f, L2 = 0.f, Hp = 0.f;
 		for (int32 i = 0; i < A.Num(); ++i)
 		{
 			const float T = i / SR;
-			L1 += (Rng.FRandRange(-1.f, 1.f) - L1) * 0.35f;
-			L2 += (L1 - L2) * 0.03f;
-			A[i] = (L1 - L2) * FMath::Min(1.f, T / 0.02f) * FMath::Exp(-T * 9.f);
+			L1 += (Rng.FRandRange(-1.f, 1.f) - L1) * 0.08f;
+			L2 += (L1 - L2) * 0.08f;
+			Hp += (L2 - Hp) * 0.004f;
+			const float Rattle = 0.7f + 0.3f * FMath::Sin(TwoPi * 23.f * T);
+			A[i] = (L2 - Hp) * Rattle * FMath::Min(1.f, T / 0.015f) * FMath::Exp(-T * 7.f);
 		}
 	}
 	// Борт: глухой деревянный удар
@@ -178,13 +178,13 @@ void FSoccerAudio::Init()
 
 	// Пик каждого звука — 1, дальше громкость задаётся множителем
 	const float Gains[(int32)ESoccerSound::Count] = {
-		0.6f,  // Kick
-		0.25f, // Touch
+		1.0f,  // Kick
+		0.35f, // Touch
 		0.35f, // Whistle
 		0.35f, // WhistleLong
 		0.35f, // WhistleEnd
-		0.45f, // Post
-		0.6f,  // Net
+		0.85f, // Post: a clear clank, it was lost under the rest
+		0.8f,  // Net
 		0.4f,  // Board
 		0.9f,  // Roar
 		0.8f,  // Ooh

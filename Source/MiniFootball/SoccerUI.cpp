@@ -11,8 +11,10 @@
 #include "Widgets/SOverlay.h"
 #include "Widgets/SNullWidget.h"
 #include "Widgets/Layout/SBox.h"
+#include "Widgets/Layout/SDPIScaler.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Text/STextBlock.h"
+#include "Widgets/Notifications/SProgressBar.h"
 #include "Widgets/Input/SButton.h"
 #include "Styling/CoreStyle.h"
 #include "Styling/SlateTypes.h"
@@ -1194,6 +1196,15 @@ TSharedRef<SWidget> SSoccerMenu::BuildPractice()
 	USoccerSave* S = GetSave();
 	const TWeakObjectPtr<ASoccerGameMode> G = GM;
 	TSharedRef<SVerticalBox> List = SNew(SVerticalBox);
+	List->AddSlot().AutoHeight().Padding(0.f, 0.f, 0.f, 12.f)
+	[
+		Track(PanelButton([G]() { if (G.IsValid()) G->StartMatch(ESoccerMode::FreeTraining); }, [](const FHotFn&) -> TSharedRef<SWidget>
+		{
+			return SNew(SVerticalBox)
+				+ SVerticalBox::Slot().AutoHeight()[Txt(Ru(TEXT("СВОБОДНАЯ ТРЕНИРОВКА")), FontBold(28), ColLime())]
+				+ SVerticalBox::Slot().AutoHeight()[Txt(Ru(TEXT("Один пёс, мяч и без таймера. Мягкие касания, пас и удар — для настройки управления.")), FontRegular(17), ColGray())];
+		}))
+	];
 	for (int32 i = 0; i < NumPractice; ++i)
 	{
 		const FPractice Pr = Practices[i];
@@ -1501,7 +1512,9 @@ void SSoccerPause::Construct(const FArguments& InArgs)
 	const TSharedRef<SButton> Resume = TextItem(Ru(TEXT("ПРОДОЛЖИТЬ")), 44.f, [G]() { if (G.IsValid()) G->TogglePause(); });
 	FirstFocus = Resume;
 
-	const FText ScoreLine = G.IsValid()
+	// Training has no score and no match stats
+	const bool bTraining = G.IsValid() && G->IsFreeTraining();
+	const FText ScoreLine = bTraining ? Ru(TEXT("ТРЕНИРОВКА")) : G.IsValid()
 		? FText::FromString(FString::Printf(TEXT("%s  %d : %d  %s"), *G->GetTeamName(0), G->GetScore(0), G->GetScore(1), *G->GetTeamName(1)))
 		: FText::GetEmpty();
 
@@ -1527,7 +1540,7 @@ void SSoccerPause::Construct(const FArguments& InArgs)
 				]
 				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(0.f, 0.f, 0.f, 22.f)
 				[
-					StatsTable(G, 18.f)
+					bTraining ? SNullWidget::NullWidget : StatsTable(G, 18.f)
 				]
 				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
 				[
@@ -1785,6 +1798,25 @@ TSharedRef<SWidget> PlayerCard(const TWeakObjectPtr<ASoccerGameMode>& G, bool bH
 				Header
 			]
 		]
+		// Stamina: always shown under the name card, drains on sprint and refills when jogging
+		+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Fill)
+		[
+			SNew(SBox).HeightOverride(7.f)
+			[
+				SNew(SProgressBar)
+				.BarFillType(bHuman ? EProgressBarFillType::LeftToRight : EProgressBarFillType::RightToLeft)
+				.Percent_Lambda([Get]() -> TOptional<float>
+				{
+					const ASoccerPlayer* P = Get();
+					return P ? P->GetStamina() : 0.f;
+				})
+				.FillColorAndOpacity_Lambda([Get]()
+				{
+					const ASoccerPlayer* P = Get();
+					return FSlateColor(P && P->GetStamina() <= 0.3f ? FLinearColor(1.f, 0.35f, 0.1f) : FLinearColor(0.35f, 1.f, 0.05f));
+				})
+			]
+		]
 		+ SVerticalBox::Slot().AutoHeight().HAlign(bHuman ? HAlign_Left : HAlign_Right).Padding(0.f, 6.f, 0.f, 0.f)
 		[
 			SNew(SBorder).BorderImage(WhiteBrush()).BorderBackgroundColor(FLinearColor(0.f, 0.f, 0.f, 0.45f))
@@ -1875,26 +1907,32 @@ TSharedRef<SWidget> SoccerUI::MakeHud(ASoccerGameMode* GameMode)
 	}
 
 	return SNew(SOverlay)
-		.Visibility(EVisibility::HitTestInvisible)
+		.Visibility_Lambda([G]() { return G.IsValid() && G->IsIntro() ? EVisibility::Collapsed : EVisibility::HitTestInvisible; })
 		+ SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Top).Padding(0.f, 12.f, 0.f, 0.f)
 		[
-			Top
+			// Names and score mean nothing in training: keep the top of the screen clear.
+			SNew(SBox)
+			.Visibility_Lambda([G]() { return G.IsValid() && G->IsFreeTraining() ? EVisibility::Collapsed : EVisibility::HitTestInvisible; })
+			[
+				// Goals keeps the bar small: its names are ~1.3% of the screen height
+				SNew(SDPIScaler).DPIScale(0.62f)[ Top ]
+			]
 		]
 		+ SOverlay::Slot().HAlign(HAlign_Left).VAlign(VAlign_Bottom).Padding(56.f, 0.f, 0.f, 36.f)
 		[
-			PlayerCard(G, true)
+			SNew(SDPIScaler).DPIScale(0.8f)
+			.Visibility_Lambda([G]() { return G.IsValid() && G->IsCelebrating() ? EVisibility::Hidden : EVisibility::HitTestInvisible; })
+			[ PlayerCard(G, true) ]
 		]
 		+ SOverlay::Slot().HAlign(HAlign_Right).VAlign(VAlign_Bottom).Padding(0.f, 0.f, 56.f, 36.f)
 		[
-			PlayerCard(G, false)
+			SNew(SDPIScaler).DPIScale(0.8f)
+			.Visibility_Lambda([G]() { return G.IsValid() && G->IsCelebrating() ? EVisibility::Hidden : EVisibility::HitTestInvisible; })
+			[ PlayerCard(G, false) ]
 		]
 		+ SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
 		[
 			Banner(G)
 		]
-		+ SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Bottom).Padding(0.f, 0.f, 0.f, 12.f)
-		[
-			Txt(Ru(TEXT("Зажмите пас или удар — стрелка покажет направление   ·   Start / P — пауза и статистика")),
-			    FontRegular(15), FLinearColor(1.f, 1.f, 1.f, 0.55f))
-		];
+		;
 }

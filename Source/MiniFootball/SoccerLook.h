@@ -11,9 +11,11 @@
 #include "CoreMinimal.h"
 #include "Animation/AnimSingleNodeInstance.h"
 #include "Animation/AnimSingleNodeInstanceProxy.h"
+#include "AnimNodes/AnimNode_RetargetPoseFromMesh.h"
 #include "SoccerLook.generated.h"
 
 class USkeletalMeshComponent;
+class UIKRetargeter;
 
 // Рецепт внешности (хранится в карточке игрока и в сохранении). Значения ползунков 0..1.
 USTRUCT()
@@ -65,9 +67,24 @@ struct FSoccerAnimInstanceProxy : public FAnimSingleNodeInstanceProxy
 	FSoccerAnimInstanceProxy(UAnimInstance* InAnimInstance) : FAnimSingleNodeInstanceProxy(InAnimInstance) {}
 
 	virtual void PreUpdate(UAnimInstance* InAnimInstance, float DeltaSeconds) override;
+	virtual void UpdateAnimationNode(const FAnimationUpdateContext& InContext) override;
+	virtual void CacheBones() override;
 	virtual bool Evaluate(FPoseContext& Output) override;
 
+	// Motion Matching: the pose of a hidden Epic mannequin, retargeted onto this skeleton.
+	// The single-node clip then plays only as an action layer (kick, trap...) on top.
+	FAnimNode_RetargetPoseFromMesh Retarget;
+	bool bRetargetReady = false;
+	float ActionWeight = 0.f;
+	uint8 ActionFoot = 0;          // 0 = the clip takes the whole body; 1/2 = left/right kick
+	TArray<uint8> BoneGroup;       // per compact bone: 0 torso, 1 hips, 2 left leg, 3 right leg
+
 	TArray<FSoccerBoneScale> BoneScales;
+	bool bLockRootMotionXY = false;
+	// Previous clip, faded out over the first frames of the new one.
+	const UAnimSequenceBase* BlendFrom = nullptr;
+	float BlendFromTime = 0.f;
+	float BlendWeight = 0.f; // weight of the previous clip, 1 -> 0
 };
 
 // AnimInstance игрока: как стандартный Single Node (PlayAnimation/SetPlayRate работают), плюс масштаб костей.
@@ -78,8 +95,33 @@ class USoccerAnimInstance : public UAnimSingleNodeInstance
 
 public:
 	TArray<FSoccerBoneScale> BoneScales; // заполняет SoccerLook::Apply
+	bool bLockRootMotionXY = false;
+
+	// Switch clip with a crossfade from the current one. Locomotion loops keep their
+	// normalized phase, so Run <-> Sprint does not restart the stride.
+	void CrossfadeTo(UAnimSequenceBase* NewClip, bool bLoop, float BlendTime, bool bKeepPhase);
+
+	// Locomotion comes from Source through Retargeter; see FSoccerAnimInstanceProxy::Retarget.
+	void SetMotionSource(USkeletalMeshComponent* Source, UIKRetargeter* Retargeter);
+	bool HasMotionSource() const { return MotionSource.IsValid(); }
+	float ActionWeight = 0.f; // 0 = pure motion matching, 1 = pure action clip
+	uint8 ActionFoot = 0;     // kick layered on the run: 1 left / 2 right leg + torso only
 
 protected:
+	virtual void NativeUpdateAnimation(float DeltaSeconds) override;
+
+	UPROPERTY(Transient) TObjectPtr<const UAnimSequenceBase> BlendFrom;
+	float BlendFromTime = 0.f;
+	float BlendFromRate = 1.f;
+	bool bBlendFromLoop = true;
+	float BlendElapsed = 0.f;
+	float BlendDuration = 0.f;
+
+	TWeakObjectPtr<USkeletalMeshComponent> MotionSource;
+	UPROPERTY(Transient) TObjectPtr<UIKRetargeter> MotionRetargeter;
+
+	friend struct FSoccerAnimInstanceProxy;
+
 	virtual FAnimInstanceProxy* CreateAnimInstanceProxy() override;
 	virtual void DestroyAnimInstanceProxy(FAnimInstanceProxy* InProxy) override;
 };

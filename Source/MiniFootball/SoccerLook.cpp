@@ -3,6 +3,9 @@
 #include "Engine/SkeletalMesh.h"
 #include "Animation/AnimNodeBase.h"
 #include "BonePose.h"
+#include "AnimationRuntime.h"
+#include "Animation/AnimationPoseData.h"
+#include "Animation/AnimSequenceBase.h"
 
 // ============================================================================
 //  Рецепт внешности
@@ -180,11 +183,163 @@ void FSoccerAnimInstanceProxy::PreUpdate(UAnimInstance* InAnimInstance, float De
 {
 	FAnimSingleNodeInstanceProxy::PreUpdate(InAnimInstance, DeltaSeconds);
 	BoneScales = CastChecked<USoccerAnimInstance>(InAnimInstance)->BoneScales; // копия для потока анимации
+	const USoccerAnimInstance* Anim = CastChecked<USoccerAnimInstance>(InAnimInstance);
+	bLockRootMotionXY = Anim->bLockRootMotionXY;
+	const bool bBlending = Anim->BlendFrom && Anim->BlendElapsed < Anim->BlendDuration;
+	BlendFrom = bBlending ? Anim->BlendFrom.Get() : nullptr;
+	BlendFromTime = Anim->BlendFromTime;
+	// Smoothstep keeps the fade from looking like a linear pop at either end.
+	const float Alpha = bBlending ? FMath::Clamp(Anim->BlendElapsed / Anim->BlendDuration, 0.f, 1.f) : 1.f;
+	BlendWeight = 1.f - Alpha * Alpha * (3.f - 2.f * Alpha);
+
+	ActionWeight = Anim->ActionWeight;
+	ActionFoot = Anim->ActionFoot;
+	USkeletalMeshComponent* Source = Anim->MotionSource.Get();
+	if (Source && Anim->MotionRetargeter)
+	{
+		if (!bRetargetReady)
+		{
+			// The default mode looks for an attached parent mesh; ours is a sibling component.
+			Retarget.RetargetFrom = ERetargetSourceMode::CustomSkeletalMeshComponent;
+			Retarget.SourceMeshComponent = Source;
+			Retarget.IKRetargeterAsset = Anim->MotionRetargeter;
+			Retarget.Initialize_AnyThread(FAnimationInitializeContext(this));
+			Retarget.CacheBones_AnyThread(FAnimationCacheBonesContext(this));
+			bRetargetReady = true;
+		}
+		Retarget.PreUpdate(InAnimInstance); // copies the source pose on the game thread
+	}
+	else bRetargetReady = false;
+}
+
+void FSoccerAnimInstanceProxy::UpdateAnimationNode(const FAnimationUpdateContext& InContext)
+{
+	FAnimSingleNodeInstanceProxy::UpdateAnimationNode(InContext);
+	if (bRetargetReady) Retarget.Update_AnyThread(InContext);
+}
+
+void FSoccerAnimInstanceProxy::CacheBones()
+{
+	FAnimSingleNodeInstanceProxy::CacheBones();
+	if (bRetargetReady) Retarget.CacheBones_AnyThread(FAnimationCacheBonesContext(this));
+}
+
+void USoccerAnimInstance::SetMotionSource(USkeletalMeshComponent* Source, UIKRetargeter* Retargeter)
+{
+	MotionSource = Source;
+	MotionRetargeter = Retargeter;
+}
+
+void USoccerAnimInstance::CrossfadeTo(UAnimSequenceBase* NewClip, bool bLoop, float BlendTime, bool bKeepPhase)
+{
+	UAnimSequenceBase* Old = Cast<UAnimSequenceBase>(GetAnimationAsset());
+	const float OldTime = GetCurrentTime();
+	float StartTime = 0.f;
+	if (bKeepPhase && Old && NewClip && IsLooping() && bLoop)
+	{
+		const float Phase = OldTime / FMath::Max(0.01f, Old->GetPlayLength());
+		StartTime = FMath::Frac(Phase) * NewClip->GetPlayLength();
+	}
+	if (Old && BlendTime > 0.f)
+	{
+		BlendFrom = Old;
+		BlendFromTime = OldTime;
+		BlendFromRate = GetPlayRate();
+		bBlendFromLoop = IsLooping();
+		BlendElapsed = 0.f;
+		BlendDuration = BlendTime;
+	}
+	else BlendFrom = nullptr;
+	SetAnimationAsset(NewClip, bLoop, GetPlayRate());
+	SetPosition(StartTime, false);
+	SetPlaying(true);
+}
+
+void USoccerAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
+{
+	Super::NativeUpdateAnimation(DeltaSeconds);
+	if (!BlendFrom) return;
+	BlendElapsed += DeltaSeconds;
+	BlendFromTime += DeltaSeconds * BlendFromRate;
+	const float Length = BlendFrom->GetPlayLength();
+	BlendFromTime = bBlendFromLoop ? FMath::Fmod(BlendFromTime, FMath::Max(0.01f, Length)) : FMath::Min(BlendFromTime, Length);
+	if (BlendElapsed >= BlendDuration) BlendFrom = nullptr;
 }
 
 bool FSoccerAnimInstanceProxy::Evaluate(FPoseContext& Output)
 {
-	const bool bResult = FAnimSingleNodeInstanceProxy::Evaluate(Output);
+	// Mixamo uses the pelvis as root. Keep its bounce and rotation (including dives),
+	// while CharacterMovement supplies horizontal travel.
+	auto LockRootXY = [this](FCompactPose& Pose)
+	{
+		if (!bLockRootMotionXY || Pose.GetNumBones() == 0) return;
+		FTransform& Root = Pose[FCompactPoseBoneIndex(0)];
+		FVector Translation = Root.GetTranslation();
+		const FVector Reference = Pose.GetBoneContainer().GetRefPoseTransform(FCompactPoseBoneIndex(0)).GetTranslation();
+		Translation.X = Reference.X;
+		Translation.Y = Reference.Y;
+		Root.SetTranslation(Translation);
+	};
+
+	bool bResult = true;
+	if (bRetargetReady)
+	{
+		// Locomotion from motion matching; the clip is only an action layer on top.
+		Retarget.Evaluate_AnyThread(Output);
+		if (ActionWeight > 0.001f)
+		{
+			FPoseContext Action(Output);
+			FAnimSingleNodeInstanceProxy::Evaluate(Action);
+			LockRootXY(Action.Pose);
+			if (ActionFoot == 0)
+			{
+				FAnimationPoseData OutputData(Output);
+				FAnimationPoseData ActionData(Action);
+				FAnimationRuntime::BlendTwoPosesTogetherInPlace(OutputData, ActionData, 1.f - ActionWeight);
+			}
+			else
+			{
+				// Kick on the run: the kicking leg follows the clip, the torso most of it,
+				// the hips a little and the standing leg keeps the stride.
+				FCompactPose& Pose = Output.Pose;
+				const FBoneContainer& Bones = Pose.GetBoneContainer();
+				if (BoneGroup.Num() != Pose.GetNumBones())
+				{
+					BoneGroup.SetNumZeroed(Pose.GetNumBones());
+					for (FCompactPoseBoneIndex Index : Pose.ForEachBoneIndex())
+					{
+						const FString Name = Bones.GetReferenceSkeleton().GetBoneName(Bones.MakeMeshPoseIndex(Index).GetInt()).ToString();
+						const bool bLeg = Name.Contains(TEXT("UpLeg")) || Name.EndsWith(TEXT("Leg")) || Name.Contains(TEXT("Foot")) || Name.Contains(TEXT("Toe"));
+						uint8 Group = 0;
+						if (Name.EndsWith(TEXT("Hips"))) Group = 1;
+						else if (bLeg) Group = Name.Contains(TEXT("Left")) ? 2 : 3;
+						BoneGroup[Index.GetInt()] = Group;
+					}
+				}
+				const uint8 KickGroup = ActionFoot == 1 ? 2 : 3;
+				for (FCompactPoseBoneIndex Index : Pose.ForEachBoneIndex())
+				{
+					const uint8 Group = BoneGroup[Index.GetInt()];
+					const float Mask = Group == KickGroup ? 1.f : (Group == 0 ? 0.6f : (Group == 1 ? 0.3f : 0.1f));
+					Pose[Index].BlendWith(Action.Pose[Index], ActionWeight * Mask);
+				}
+				Pose.NormalizeRotations();
+			}
+		}
+	}
+	else
+	{
+		bResult = FAnimSingleNodeInstanceProxy::Evaluate(Output);
+		if (BlendFrom && BlendWeight > 0.001f)
+		{
+			FPoseContext Previous(Output);
+			FAnimationPoseData PreviousData(Previous);
+			BlendFrom->GetAnimationPose(PreviousData, FAnimExtractContext(double(BlendFromTime)));
+			FAnimationPoseData OutputData(Output);
+			FAnimationRuntime::BlendTwoPosesTogetherInPlace(OutputData, PreviousData, 1.f - BlendWeight);
+		}
+		LockRootXY(Output.Pose);
+	}
 	if (BoneScales.Num() == 0) return bResult;
 
 	FCompactPose& Pose = Output.Pose;

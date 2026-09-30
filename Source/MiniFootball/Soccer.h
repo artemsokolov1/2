@@ -46,18 +46,40 @@ class SWidget;
 struct FInputActionValue;
 struct FKey;
 
-// Размеры в сантиметрах (1 uu = 1 см). Поле 40×27 м, ворота 3×2 м.
+// Variants A/B/C of an action, compared in game: D-pad up/down (PageUp/PageDown) picks
+// the action, left/right ([ / ]) the variant. Kept in GameUserSettings.ini and in the
+// console variables mf.Var.<Action> (for the test harness).
+namespace SoccerVariants
+{
+	enum EAction : int32 { KickOnRun, Dribble, Receive, Keeper, Support, Defense, Tempo, Num };
+	struct FAction { const TCHAR* Id; const TCHAR* Title; const TCHAR* Names[3]; };
+	const FAction& Describe(int32 Action);
+	int32 Get(int32 Action);
+	void Set(int32 Action, int32 Variant);
+	void Load();
+	// Number settings after the actions in the same D-pad list (the training camera):
+	// left/right steps the value; the last entry puts them all back to the Goals values.
+	int32 NumTunes();                      // including the reset entry
+	const TCHAR* TuneTitle(int32 Tune);
+	FString TuneValue(int32 Tune);         // empty for the reset entry
+	void StepTune(int32 Tune, int32 Dir);
+	inline int32 NumEntries() { return Num + NumTunes(); }
+}
+
+// Размеры в сантиметрах (1 uu = 1 см). Поле 40×27 м, ворота 5×2.2 м.
 // Центр поля — (0,0,0). Длинная ось поля — X, ширина — Y.
 // Команда 0 (человек) атакует в сторону +X, команда 1 — в сторону −X.
 namespace Soccer
 {
 	constexpr float HalfLength    = 2000.f; // половина длины поля
 	constexpr float HalfWidth     = 1350.f; // половина ширины поля
-	constexpr float GoalHalfWidth = 150.f;  // половина ширины ворот
-	constexpr float GoalHeight    = 200.f;  // высота ворот
+	// 5 x 2.2 m: ~2.7 keeper heights (a 1.88 m giraffe). At 3 x 2 m the keeper covered
+	// almost the whole goal and a shot into the corner was no better than one at him.
+	constexpr float GoalHalfWidth = 250.f;  // половина ширины ворот
+	constexpr float GoalHeight    = 220.f;  // высота ворот
 	constexpr float GoalDepth     = 100.f;  // глубина ворот (до задней сетки)
 	constexpr float BoardGap      = 10.f;   // борт стоит сразу за боковой линией — линии «настоящие»
-	constexpr float BallRadius    = 22.f;   // радиус мяча
+	constexpr float BallRadius    = 11.f;   // радиус мяча: стандартный размер футбольного мяча
 	constexpr float PlayerRadius  = 35.f;   // радиус корпуса игрока (столкновения мяча с игроками)
 	constexpr float PenaltyDepth  = 600.f;  // глубина штрафной площади
 	constexpr int32 HumanTeam     = 0;      // человек играет за команду 0
@@ -78,7 +100,8 @@ enum class ESoccerMode : uint8
 	Match,            // обычный матч 5×5
 	PracticeShooting, // тренировка: удары по воротам
 	PracticeOneOnOne, // тренировка: один против защитника и вратаря
-	PracticeAttack    // тренировка: атака 5 на 2
+	PracticeAttack,   // тренировка: атака 5 на 2
+	FreeTraining     // свободная комната: один игрок, без таймера и ИИ
 };
 
 // Что сейчас «заряжает» человек (зажатая кнопка удара/паса)
@@ -201,6 +224,9 @@ public:
 	void Kick(ASoccerPlayer* Kicker, const FVector& NewVelocity, const FVector& NewSpin = FVector::ZeroVector);
 	// Толчок мяча по газону с заданной скоростью (владелец не меняется).
 	void Touch(const FVector& NewVelocity);
+	float TrapUntil = 0.f; // receive variant C: the ball is killed at the feet until then
+	float LeadUntil = 0.f; // receive variant B: first touch out in front along LeadDir
+	FVector LeadDir = FVector::ZeroVector;
 
 	// Назначить игрока, который ведёт мяч (nullptr — мяч свободен).
 	void SetOwnerPlayer(ASoccerPlayer* NewOwner);
@@ -241,6 +267,10 @@ public:
 	float MagnusCoeff     = 0.02f;   // эффект Магнуса: a = k·(ω × v)
 	float SpinDecayAir    = 0.4f;    // затухание вращения в полёте, 1/с
 
+	// Свободная тренировка: мяч ведётся касаниями вокруг собаки (ApplyControlledTouch),
+	// свободный мяч и удары — по общей физике.
+	bool bTrainingPhysics = false;
+
 	static constexpr float PostRadius = 6.f; // радиус штанг и перекладины
 
 private:
@@ -249,8 +279,16 @@ private:
 	int32 Integrate(FVector& P, FVector& V, FVector& W, float Dt) const;
 	// Борта вокруг поля и ворота: внутрь только через створ, круглые штанги и перекладина, сетка.
 	int32 CollideWithWalls(FVector& P, const FVector& OldP, FVector& V) const;
+	// Training court: fence, side boards and the goals measured from football_court.glb.
+	int32 CollideWithTrainingCourt(FVector& P, const FVector& OldP, FVector& V) const;
 	// Мяч отскакивает от корпуса и ног игроков (кроме того, кто ведёт мяч).
 	void CollideWithPlayers(FVector& P);
+	void ApplyControlledTouch(FVector& P, float Dt);
+	FVector CarryCenter = FVector::ZeroVector; // smoothed body centre of the ball carrier
+	bool bCarryCenterValid = false;
+	float CarryAngle = 0.f; // ball around the carrier: world yaw (rad) and distance (cm)
+	float CarryR = 0.f;
+	bool bCarryPolarValid = false;
 
 	float LastKickTime = -100.f;
 };
@@ -296,12 +334,14 @@ public:
 
 	// Белая стрелка от мяча в направлении паса/удара
 	void ShowArrow(const FVector& From, const FVector& To);
+	// Goals corner: the lime flight of the cross (gravity only, drag and spin ignored)
+	void ShowArc(const FVector& From, const FVector& Velocity, float Gravity);
 	void HidePath();
 
 	UPROPERTY(VisibleAnywhere) TObjectPtr<USceneComponent> Root;
 	UPROPERTY(VisibleAnywhere) TArray<TObjectPtr<UStaticMeshComponent>> Segments;
 
-	static constexpr int32 MaxSegments = 3; // древко и два «пера» наконечника
+	static constexpr int32 MaxSegments = 24; // arrow: shaft + two barbs; arc: all of them
 };
 
 // ============================================================================
@@ -315,6 +355,22 @@ class ASoccerPlayer : public ACharacter
 public:
 	ASoccerPlayer();
 	virtual void Tick(float DeltaTime) override;
+
+	// Dribble rhythm, read by the ball's carry in free training
+	float GetDribblePhase() const { return DribblePhase; }
+	bool IsCloseControl() const { return bCloseControl; }
+	bool IsSprintingNow() const { return bSprinting; }
+	// Where the body actually is: motion matching may shift the pelvis away from the capsule.
+	FVector GetBodyCenter() const;
+	// Facing of the visible torso (hips and shoulders averaged, smoothed over the stride).
+	FVector GetBodyForward() const;
+
+	// Motion Matching (Epic Game Animation Sample): BP_SoccerDog feeds these into
+	// BPI_SandboxCharacter_Pawn::Get_PropertiesForAnimation for the hidden mannequin.
+	UFUNCTION(BlueprintPure, Category = "Soccer|Animation")
+	bool WantsSprintForAnimation() const;
+	UFUNCTION(BlueprintPure, Category = "Soccer|Animation")
+	USkeletalMeshComponent* GetMotionBody() const { return MotionBody; }
 
 	// Настройка после спавна: команда, роль, позиция в расстановке, карточка, форма.
 	void Setup(int32 InTeam, bool bInGoalkeeper, const FVector& InHome, float InHomeYaw,
@@ -333,7 +389,20 @@ public:
 	// Если мяч укатился дальше, чем достаёт нога, удар откладывается: игрок добегает и бьёт.
 	void Pass(EPassKind Kind, const FVector& AimDir, float Power01 = 0.5f);
 	void Shoot(const FVector& AimDir, float Power01, bool bFinesse, bool bChip = false);
+	// FIFA fake shot (shoot, then pass while charging): the wind-up only, the ball stays.
+	void FakeShot();
 	void Header(bool bShot, const FVector& AimDir); // прыжок и удар головой по мячу в воздухе
+	// First-time kick: pressed while the pass is still on its way, it fires the moment the
+	// ball reaches the foot, with no reception touch.
+	bool IsBallComingToMe() const;
+	void QueueFirstTime(ECharge Kind, const FVector& AimDir, float Power01, bool bFinesse, bool bChip);
+	ECharge FirstTimeKind = ECharge::None;
+	FVector FirstTimeAim = FVector::ZeroVector;
+	float FirstTimePower = 0.5f;
+	bool bFirstTimeFinesse = false;
+	bool bFirstTimeChip = false;
+	float FirstTimeUntil = 0.f;
+	void TickFirstTime();
 
 	// ---------- Оборона и прочее ----------
 	void Tackle();                          // отбор ногой: попал в мяч — выбил, попал в ноги — фол
@@ -341,6 +410,7 @@ public:
 	void SkillMove(const FVector& Dir, bool bBig); // финт правым стиком: откидка мяча в сторону
 	void Stun(float Seconds);               // игрок «сбит»: теряет мяч и управление
 	void GainBall();                        // забрать мяч себе
+	float GetBallGainTime() const { return BallGainTime; }
 
 	// ---------- ИИ ----------
 	void SetAIRole(ESoccerAIRole InRole, ASoccerPlayer* InMark = nullptr);
@@ -376,9 +446,20 @@ public:
 	UPROPERTY(VisibleAnywhere) TObjectPtr<UStaticMeshComponent> Marker;
 	// Цветной круг под ногами — цвет команды (нужен, когда у всех одинаковая 3D-модель)
 	UPROPERTY(VisibleAnywhere) TObjectPtr<UStaticMeshComponent> Ring;
+	bool IsGiraffe() const { return bGiraffeModel; }
+	bool IsPlayingAction() const { return DogAction != nullptr; }
+	mutable bool bRunningInBehind = false; // set by ComputeSupportPoint: this support move is a run past the last line
+	void SnapBodyYaw() { bBodyYawValid = false; } // after a teleport: the carry must not use the old heading
+	// Keeper beaten by the shot kicked at KickTime: it goes past him, not off his body.
+	bool IsBeatenBy(float KickTime) const { return bGoalkeeper && GKDecisionKick == KickTime && !bGKWillSave; }
 
 private:
 	void UpdateAnimation();
+	friend class FDogVisualIntegrationTest;
+	void ApplyDogModel(USkeletalMesh* Mesh);
+	void SetupMotionMatching();
+	void UpdateDogAnimation();
+	void PlayDogAction(FName Action, float Duration = 0.f);
 	void TickHuman(float Dt);
 	void TickFieldAI(float Dt);
 	void TickAIWithBall(float Dt);
@@ -472,6 +553,39 @@ private:
 	UPROPERTY() TObjectPtr<UAnimSequence> IdleAnim;
 	UPROPERTY() TObjectPtr<UAnimSequence> RunAnim;
 	UPROPERTY() TObjectPtr<UAnimSequence> CurrentAnim;
+	// Hidden Epic mannequin running motion matching; the dog copies its pose (SoccerDog.cpp).
+	UPROPERTY() TObjectPtr<USkeletalMeshComponent> MotionBody;
+	float ActionWeight = 0.f;
+	float BodyYaw = 0.f;
+	bool bBodyYawValid = false;
+	void UpdateBodyYaw(float Dt);
+	UPROPERTY() TMap<FName, TObjectPtr<UAnimSequence>> DogAnimations;
+	// Mocap takes are long: play only [X, Y] seconds around the action (kick contact etc.).
+	TMap<FName, FVector2f> DogClipWindows;
+	TMap<FName, float> DogClipRate;
+	TMap<FName, float> DogClipContact; // seconds from window start to foot-ball contact
+	TMap<FName, uint8> DogClipFoot;    // kicking foot of the take: 1 left, 2 right
+	FName LastActionName;              // the action PlayDogAction started last
+	uint8 ActionFoot = 0;              // layered kick: 0 whole body, 1/2 left/right leg + torso
+	float LastActionContact = -1.f;    // its real-time delay to the ball contact (variant)
+	float KickSlowSpeed = 0.f;         // speed cap while KickSlowTime runs
+	float DogActionStart = 0.f;
+	// Kick planned on the button press, released when the foot reaches the ball.
+	FSoccerKick DelayedKick;
+	float DelayedKickTime = -1.f;
+	void KickAtContact(const FSoccerKick& Plan, FName Action);
+	// Right-stick skill move in training: a steered cut instead of a dash (see TickHuman).
+	FVector SkillDir = FVector::ZeroVector;
+	float SkillTime = 0.f;
+	float KickSlowTime = 0.f; // slowed down while planting for a pass/shot
+	float BallGainTime = -100.f; // when this player last got the ball (pressers give time)
+	UPROPERTY() TObjectPtr<UAnimSequence> DogAction;
+	float DogActionEnd = 0.f;
+	float DogActionRate = 1.f;
+	bool bDogModel = false;
+	bool bGiraffeModel = false; // SK_Giraffe on the dog skeleton (taller, own kit/retargeter)
+	float NextTrainingStateLogTime = 0.f;
+	int32 TrainingStateLogCount = 0;
 
 	FVector DashDir = FVector::ZeroVector;
 	float DashSpeed = 0.f;
@@ -506,6 +620,8 @@ public:
 	void PossessPlayer(ASoccerPlayer* NewPlayer);
 	// Сбросить зажатые кнопки/стики (при паузе, выходе в меню, старте матча).
 	void ResetInputState();
+	// В PIE локальный игрок может появиться после BeginPlay контроллера.
+	void EnsureInputMapping();
 
 	// Стик -> направление в мире с учётом поворота камеры.
 	FVector StickToWorld(const FVector2D& Stick) const;
@@ -513,6 +629,10 @@ public:
 	FVector AimDirection() const;
 	// Сила замаха 0..1 (или −1, если ничего не зажато).
 	float GetCharge() const;
+	// Team-mate the pass being aimed would go to (white tag above him, Goals style)
+	const ASoccerPlayer* GetAimReceiver() const { return AimReceiver.Get(); }
+	TWeakObjectPtr<ASoccerPlayer> AimReceiver;
+	bool bHoldMoveUntilNeutral = false; // after a pass switch: ignore the stick until released
 
 	// Текущее состояние ввода — его читает ASoccerPlayer::TickHuman
 	FVector2D MoveInput  = FVector2D::ZeroVector; // левый стик
@@ -523,6 +643,9 @@ public:
 	bool bLBHeld       = false; // LB в атаке: LB + B — удар «парашютом»
 	bool bContainHeld  = false; // A в обороне: сдерживание
 	bool bGKRushHeld   = false; // удержание Y в обороне: выход вратаря
+	// Variant picker (SoccerVariants): the action shown and until when the HUD shows it
+	int32 VariantAction = 0;
+	float VariantShowUntil = -100.f;
 
 private:
 	ASoccerPlayer* Current() const;
@@ -556,6 +679,9 @@ private:
 	void OnLB();
 	void OnLBStop();
 	void OnStart();
+	void OnR3();
+	void OnVariantAction(int32 Step);
+	void OnVariantPick(int32 Step);
 
 	UPROPERTY() TObjectPtr<UInputMappingContext> Context;
 	UPROPERTY() TArray<TObjectPtr<UInputAction>> Actions; // держим ссылки, чтобы GC не удалил
@@ -564,6 +690,8 @@ private:
 	float ChargeStart = 0.f;          // когда начали замах
 	bool bRightStickArmed = true;     // для распознавания «щелчка» правым стиком
 	float LastSwitchTime = -100.f;    // для перебора игроков повторными нажатиями LB
+	float NextTrainingMoveLogTime = 0.f;
+	int32 TrainingMoveLogCount = 0;
 };
 
 // ============================================================================
@@ -580,6 +708,12 @@ public:
 private:
 	// Радар (мини-карта поля) внизу по центру: игроки цветом формы, мяч — белая точка
 	void DrawRadar(const ASoccerGameMode* G);
+	void DrawPlayerTag(const ASoccerPlayer* P, const FLinearColor& Color, float Charge); // Charge < 0: no power bar
+	void DrawVariantPicker(const ASoccerPlayerController* PC);
+	void DrawIntro(const ASoccerGameMode* G);
+	// Smooth round tag (a drawn texture: rectangles read as a pixel diamond)
+	UPROPERTY() TObjectPtr<UTexture2D> TagTexture;
+	UTexture2D* GetTagTexture();
 };
 
 // ============================================================================
@@ -626,6 +760,14 @@ public:
 	// ---------- Стандарты ----------
 	ESoccerRestart GetRestart() const { return Restart; }
 	bool IsRestartTaker(const ASoccerPlayer* P) const;
+	// Kick-in by the human's team: the AI takes it, the human plays the one getting open.
+	bool IsKickIn() const { return bKickIn && Restart != ESoccerRestart::None; }
+	bool bKickIn = false;
+	bool bCorner = false;
+	bool IsFirstPersonCorner() const { return bCorner && Restart != ESoccerRestart::None && RestartTaker.IsValid() && RestartTaker->IsPlayerControlled(); }           // the running restart is a corner (first-person view for yours)
+	bool bPendingCorner = false;
+	// Kick-off not taken yet: everyone except the taker stands still
+	bool IsKickoffWaiting(const ASoccerPlayer* P) const { return Restart == ESoccerRestart::Kickoff && P && RestartTaker.Get() != P; }
 	bool MustKeepDistance(const ASoccerPlayer* P) const; // стоять ли игроку в стороне от мяча
 	float GetRestartRadius() const;
 
@@ -635,9 +777,21 @@ public:
 
 	// ---------- Данные для HUD и ИИ ----------
 	bool IsPlayActive() const { return bPlayActive; }
+	// Match intro (Goals, 15 s): loading card, pitch-level shot, whip, fly-over, line-up + VS
+	bool IsIntro() const { return IntroTime >= 0.f; }
+	float GetIntroTime() const { return IntroTime; }
+	float IntroTime = -1.f;
+	void BeginIntro();
+	void EndIntro();
+	void TickIntro(float Dt);
+	bool UpdateIntroCamera();
+	// Goal celebration (Goals): cards and radar step aside, confetti and spark fountains
+	bool IsCelebrating() const { return GetWorld() && GetWorld()->GetTimeSeconds() < CelebrateUntil; }
+	float CelebrateUntil = -1.f;
 	bool IsInMatch() const { return bInMatch; }
 	bool IsMatchOver() const { return bMatchOver; }
-	bool IsPractice() const { return MatchMode != ESoccerMode::Match; }
+	bool IsPractice() const { return MatchMode == ESoccerMode::PracticeShooting || MatchMode == ESoccerMode::PracticeOneOnOne || MatchMode == ESoccerMode::PracticeAttack; }
+	bool IsFreeTraining() const { return MatchMode == ESoccerMode::FreeTraining; }
 	int32 GetScore(int32 InTeam) const { return Score[InTeam]; }
 	float GetTimeLeft() const { return TimeLeft; }
 	float GetEventBannerTime() const { return EventBanner; }
@@ -651,11 +805,17 @@ public:
 	ASoccerPlayer* GetFocusOpponent() const;
 	ASoccerPlayer* GetGoalkeeper(int32 InTeam) const;
 	float GetCameraYaw() const { return CameraYaw; }
+	float GetControlCameraYaw() const;
+	// R3 in free training: close follow camera <-> wide broadcast view.
+	void ToggleTrainingCamera() { bTrainingWideCamera = !bTrainingWideCamera; }
+	bool bTrainingWideCamera = false;
 
 	UPROPERTY() TObjectPtr<ASoccerBall> Ball;
 	UPROPERTY() TObjectPtr<ASoccerAimLine> AimLine;
 	UPROPERTY() TArray<TObjectPtr<ASoccerPlayer>> Players;
 	UPROPERTY() TObjectPtr<ACameraActor> Camera;
+	UPROPERTY() TArray<TObjectPtr<AActor>> GeneratedFieldActors;
+	UPROPERTY() TArray<TObjectPtr<AActor>> TrainingRoomActors;
 
 private:
 	void LoadProgress();
@@ -667,6 +827,13 @@ private:
 	ASoccerPlayer* SpawnPlayer(int32 InTeam, int32 RosterIdx, const FSoccerPlayerInfo& PlayerInfo,
 	                           const FVector& Location, float Yaw);
 	void SpawnTeams();
+	void SpawnTrainingRoom();
+	void SpawnMatchCourt();
+	void CheckBallOut();
+	bool bOutOfPlayRestart = false; // kick-in / corner / goal kick: no wall
+	bool bPendingKickIn = false;    // the coming set piece is a kick-in
+	float TrainingBallOutTime = -1.f; // training: the ball rolled out, put it back after a moment
+	void SpawnEnvironment(float Sx, float Sy);
 	void SpawnLineup();
 	void DestroyPlayers();
 	void PossessHuman();
@@ -737,6 +904,15 @@ private:
 	FTimerHandle ResetTimer;
 	FTimerHandle MenuTimer;
 	FVector CamFocus = FVector::ZeroVector;
+	FVector TrainingCamFocus = FVector::ZeroVector; // сглаженная точка взгляда камеры тренировки
+	float TrainingCamYawNow = 0.f;                   // Goals camera: smoothed heading (also the stick's frame)
+	float TrainingCamDist = 0.f;                     // Goals camera: smoothed distance to the player
+	bool bTrainingCamValid = false;
+	bool bSideCamProps = false;
+	float MatchCamYaw = -90.f;                       // match camera heading (the stick's frame)                     // camera-side props hidden for the R3 view
+	float NextTraceShot = 0.f;   // mf.ShotEvery
+	int32 TraceShotIndex = 0;
+	static constexpr float TrainingCameraYaw = 0.f; // тренировка: камера смотрит вдоль поля на ворота (+X)
 
 	// «Телевизионная» камера матча: сбоку и сверху, как на трансляции
 	static constexpr float CameraPitch    = -48.f;

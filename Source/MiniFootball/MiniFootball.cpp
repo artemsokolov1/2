@@ -42,6 +42,8 @@ public:
 			{
 				FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([](float)
 				{
+					if (IFileManager::Get().FileExists(*(FPaths::ProjectContentDir() / TEXT("Characters/Dogs/SK_Dog_Cavapoo.uasset"))))
+						return false;
 					ImportFootballerFbx();
 					BuildCaricatureMorphs();
 					return false;
