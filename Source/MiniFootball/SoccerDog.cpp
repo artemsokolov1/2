@@ -254,7 +254,7 @@ void ASoccerPlayer::PlayDogAction(FName Action, float Duration)
 		else
 		{
 			KickSlowTime = 0.2f;
-			KickSlowSpeed = FMath::Max(250.f, GetVelocity().Size2D() * 0.8f);
+			KickSlowSpeed = FMath::Max(60.f, GetVelocity().Size2D() * 0.8f); // struck standing: stays put through the clip
 		}
 	}
 	DogActionEnd = GetWorld()->GetTimeSeconds() + Duration;

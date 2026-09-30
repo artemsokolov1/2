@@ -8,6 +8,14 @@
 #include "Components/StaticMeshComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/LightComponent.h"
+#include "Components/PointLightComponent.h"
+#include "Components/SpotLightComponent.h"
+#include "Components/SkyLightComponent.h"
+#include "Engine/PointLight.h"
+#include "Engine/SpotLight.h"
+#include "Engine/SkyLight.h"
+#include "Engine/PostProcessVolume.h"
+#include "Components/HierarchicalInstancedStaticMeshComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Camera/CameraActor.h"
@@ -110,8 +118,9 @@ namespace SoccerVariants
 		{TEXT("Support"), TEXT("ОТКРЫВАНИЯ"), {TEXT("как сейчас"), TEXT("ширина и глубина"), TEXT("треугольники")}},
 		{TEXT("Defense"), TEXT("ОБОРОНА"), {TEXT("вплотную"), TEXT("как в Goals"), TEXT("средне")}},
 		{TEXT("Tempo"), TEXT("ТЕМП ИИ"), {TEXT("много ведёт"), TEXT("как в Goals"), TEXT("в одно касание")}},
+		{TEXT("Pass"), TEXT("ПАС НИЗОМ"), {TEXT("как сейчас"), TEXT("по стику"), TEXT("по стику, без разброса")}},
 	};
-	static int32 GValues[Num] = {1, 1, 0, 1, 1, 1, 1}; // the player's picks (2026-09-29): kick B, dribble B, receive A, keeper B
+	static int32 GValues[Num] = {1, 1, 0, 1, 1, 1, 1, 2}; // the player's picks (2026-09-29): kick B, dribble B, receive A, keeper B; pass C (09-30)
 	static FAutoConsoleVariableRef CVarKickOnRun(TEXT("mf.Var.KickOnRun"), GValues[KickOnRun],
 		TEXT("Kick while running: 0 A = kicking leg and torso over the run, 1 B = full clip with a short wind-up, 2 C = ball leaves on the press"));
 	static FAutoConsoleVariableRef CVarReceive(TEXT("mf.Var.Receive"), GValues[Receive],
@@ -126,6 +135,8 @@ namespace SoccerVariants
 		TEXT("AI with the ball: 0 A = dribbles into space, 1 B = Goals (moves it on, the longer it holds the more it passes), 2 C = one-two touch"));
 	static FAutoConsoleVariableRef CVarDribble(TEXT("mf.Var.Dribble"), GValues[Dribble],
 		TEXT("Dribble: 0 A = as tuned for the dog, 1 B = close to the feet, 2 C = long knocks (FIFA sprint)"));
+	static FAutoConsoleVariableRef CVarPass(TEXT("mf.Var.Pass"), GValues[Pass],
+		TEXT("Your ground pass: 0 A = as before (wide cone, near mate wins), 1 B = the mate the stick points at, half the error, 2 C = as B with no random error"));
 	static const TCHAR* Section = TEXT("MiniFootball.Variants");
 
 	const FAction& Describe(int32 Action) { return GActions[FMath::Clamp(Action, 0, Num - 1)]; }
@@ -485,7 +496,7 @@ void ASoccerBall::Tick(float Dt)
 
 	FVector P = GetActorLocation();
 
-	if (OwnerPlayer && OwnerPlayer->bGoalkeeper)
+	if (OwnerPlayer && OwnerPlayer->bGoalkeeper && !OwnerPlayer->bBallAtFeet)
 	{
 		// Вратарь держит мяч в руках: between the paws of the model (the capsule-based
 		// point floated in the air in front of the smaller dog)
@@ -503,7 +514,15 @@ void ASoccerBall::Tick(float Dt)
 	}
 	else if (OwnerPlayer)
 	{
-		if (bTrainingPhysics)
+		const ASoccerGameMode* RG = GetWorld()->GetAuthGameMode<ASoccerGameMode>();
+		if (RG && RG->IsRestartTaker(OwnerPlayer) && RG->GetRestart() != ESoccerRestart::Kickoff)
+		{
+			// a set piece: the ball stays on its spot until it is played (the taker may stand beside it)
+			P = RG->GetSetPieceSpot();
+			P.Z = BallRadius;
+			Velocity = Spin = FVector::ZeroVector;
+		}
+		else if (bTrainingPhysics)
 		{
 			// Carried in touches around the dog; the boards still stop it.
 			const FVector OldP = P;
@@ -570,9 +589,10 @@ void ASoccerBall::ApplyControlledTouch(FVector& P, float Dt)
 	const FVector OwnerVelocity(OwnerPlayer->GetVelocity().X, OwnerPlayer->GetVelocity().Y, 0.f);
 	const float Speed = OwnerVelocity.Size();
 	const FVector Center(CarryCenter.X + OwnerVelocity.X / CenterRate, CarryCenter.Y + OwnerVelocity.Y / CenterRate, Body.Z);
-	// Straight ahead on the running line; standing, in front of the body.
+	// In front of the visible torso, running or standing. Following the capsule's velocity swung
+	// the ball round to the new heading on a turn before the body had turned: it ran away from him.
 	const float LeadLeft = LeadUntil - GetWorld()->GetTimeSeconds();
-	const FVector WantDir = LeadLeft > 0.f ? LeadDir : (Speed > 60.f ? OwnerVelocity / Speed : OwnerPlayer->GetBodyForward());
+	const FVector WantDir = LeadLeft > 0.f ? LeadDir : OwnerPlayer->GetBodyForward();
 
 	const bool bClose = OwnerPlayer->IsCloseControl();
 	const bool bSprint = OwnerPlayer->IsSprintingNow() || Speed > 470.f; // above run pace
@@ -588,8 +608,9 @@ void ASoccerBall::ApplyControlledTouch(FVector& P, float Dt)
 		{40.f, 6.f, 8.f, 40.f, 80.f, 0.012f}};
 	const FCarry& C = Carries[SoccerVariants::Get(SoccerVariants::Dribble)];
 	const float Push = bClose ? C.PushClose : (bSprint ? C.PushSprint : C.PushRun);
-	// Clear of the swinging feet (they reach ~35-40 cm ahead of the pelvis in a stride).
-	const float MinR = C.MinR;
+	// Clear of the swinging feet (they reach ~35-40 cm ahead of the pelvis in a running stride);
+	// walking and turning on the ball the steps are short and it sits at the foot (Goals).
+	const float MinR = FMath::Lerp(30.f, C.MinR, FMath::Clamp(Speed / 450.f, 0.f, 1.f));
 	const bool bTrap = GetWorld()->GetTimeSeconds() < TrapUntil;
 	float WantR = bTrap ? MinR : MinR + (Speed > 80.f ? (bClose ? 4.f : C.Base) + Push * Pulse + Speed * C.PerSpeed : 0.f);
 	if (LeadLeft > 0.f) WantR += 70.f * FMath::Sin(PI * FMath::Clamp(1.f - LeadLeft / 0.5f, 0.f, 1.f)); // out and back
@@ -609,7 +630,9 @@ void ASoccerBall::ApplyControlledTouch(FVector& P, float Dt)
 	const float TurnRate = (bTrap || LeadLeft > 0.f) ? 20.f : (bClose ? 16.f : 11.f); // how fast the ball swings round (1/s)
 	const float MaxStep = (bClose ? 14.f : 10.f) * Dt; // rad per frame
 	CarryAngle += FMath::Clamp(Delta * (1.f - FMath::Exp(-TurnRate * Dt)), -MaxStep, MaxStep);
-	CarryR = FMath::Max(MinR, FMath::FInterpTo(CarryR, WantR, Dt, bTrap ? 30.f : 20.f));
+	// Just received: the ball settles in over ~0.3 s instead of snapping onto the paw
+	const bool bJustGained = GetWorld()->GetTimeSeconds() - OwnerPlayer->GetBallGainTime() < 0.3f;
+	CarryR = FMath::Max(MinR, FMath::FInterpTo(CarryR, WantR, Dt, bTrap ? 30.f : (bJustGained ? 6.f : 20.f)));
 
 	const FVector NewP(Center.X + FMath::Cos(CarryAngle) * CarryR, Center.Y + FMath::Sin(CarryAngle) * CarryR, BallRadius);
 	Velocity = (NewP - FVector(P.X, P.Y, BallRadius)) / Dt;
@@ -1277,6 +1300,7 @@ void ASoccerPlayer::GainBall()
 	const bool bRealReception = (G->Ball->Velocity - GetVelocity()).Size2D() > 450.f;
 	G->Ball->SetOwnerPlayer(this);
 	BallGainTime = GetWorld()->GetTimeSeconds();
+	GKHoldTime = 0.f; // a keeper on a goal kick looks up before playing it
 	G->OnBallGained(this);
 	AIDecisionTimer = 0.4f; // ИИ «осматривается» перед решением
 	// No trap clip for the dogs: the only take is 4.9 s long and squeezed into 0.35 s it
@@ -1417,6 +1441,14 @@ void ASoccerPlayer::UpdateLocomotion(float Dt)
 		KickSlowTime -= GetWorld()->GetDeltaSeconds();
 		Move->MaxWalkSpeed = FMath::Min(Move->MaxWalkSpeed, KickSlowSpeed);
 	}
+	// A whole-body clip (kick, fall, tackle, header) owns the legs: the capsule must not glide on
+	// under it (read as skating: the passer after a kick-off pass, a tackled player getting up).
+	// A kick keeps most of the run it was struck on; anything else nearly stands.
+	if (DogAction && ActionFoot == 0 && !bGoalkeeper && GetWorld()->GetTimeSeconds() < DogActionEnd)
+	{
+		const bool bKick = LastActionName == TEXT("Pass") || LastActionName == TEXT("Shot") || LastActionName == TEXT("FakeShot");
+		Move->MaxWalkSpeed = FMath::Min(Move->MaxWalkSpeed, bKick ? KickSlowSpeed : 40.f);
+	}
 	if (bFreeTraining || (bDogModel && !bGoalkeeper))
 	{
 		// Close to Epic's motion matching character (accel 800 -> 300 at sprint, braking 2000,
@@ -1506,7 +1538,7 @@ void ASoccerPlayer::TryControlBall()
 	const float Dist = ToBall.Size();
 
 	// Зона приёма: игрок человека дотягивается дальше (помощь при приёме, как в FIFA)
-	const float Reach = IsPlayerControlled() ? 105.f : 85.f;
+	const float Reach = 85.f; // was 105 for yours: the ball jumped to the feet from a metre away
 	if (Dist > Reach || B.Z > 150.f) return; // выше полутора метров — только головой
 
 	// Качество приёма: навык (ДРБ и ПАС) против сложности мяча — скорость, высота,
@@ -1653,6 +1685,14 @@ bool ASoccerPlayer::IsBallComingToMe() const
 	const FVector To = GetActorLocation() - Ball->GetActorLocation();
 	const FVector V = Ball->Velocity;
 	return V.Size2D() > 250.f && To.Size2D() < 2500.f && FVector::DotProduct(V.GetSafeNormal2D(), To.GetSafeNormal2D()) > 0.85f;
+}
+
+bool ASoccerPlayer::IsLooseBallNear() const
+{
+	const ASoccerGameMode* G = GM();
+	if (!G || !G->Ball || G->Ball->OwnerPlayer) return false;
+	const FVector B = G->Ball->GetActorLocation();
+	return IsBallComingToMe() || (FVector::Dist2D(B, GetActorLocation()) < 400.f && B.Z < 110.f);
 }
 
 void ASoccerPlayer::QueueFirstTime(ECharge Kind, const FVector& AimDir, float Power01, bool bFinesse, bool bChip)
@@ -1835,6 +1875,16 @@ void ASoccerPlayer::TickHuman(float Dt)
 		const float MeetDist = ToMeet.Size();
 		if (MeetDist > 25.f) AssistMove = ToMeet / MeetDist * FMath::Clamp(MeetDist / 180.f, 0.25f, 1.f);
 	}
+	// A kick charged or queued onto a loose ball (first time, or after a right-stick knock):
+	// run onto it at once; the stick only aims the kick.
+	if (!bHas && !Ball->OwnerPlayer && (PC->GetCharge() >= 0.f || FirstTimeKind != ECharge::None))
+	{
+		FVector Meet;
+		InterceptTime(Meet);
+		FVector ToMeet = Meet - GetActorLocation();
+		ToMeet.Z = 0.f;
+		AssistMove = ToMeet.Size() > 25.f ? ToMeet.GetSafeNormal() : FVector::ZeroVector;
+	}
 
 	// A в обороне (удержание): сдерживание — встаём между мячом и своими воротами
 	if (PC->bContainHeld && !TeamHasBall())
@@ -1867,6 +1917,18 @@ void ASoccerPlayer::TickHuman(float Dt)
 		}
 	}
 
+	// Turning with the ball (measured on Goals: a stick circled round makes the carrier turn on
+	// the ball in a ~1.5 m circle, one turn per ~1.6 s). The further the stick is from the run,
+	// the slower he goes, down to a walk: a tight turn instead of a wide arc at running pace.
+	if (bHas && !Move.IsNearlyZero())
+	{
+		const FVector Run = GetVelocity().GetSafeNormal2D();
+		if (!Run.IsNearlyZero())
+		{
+			const float Along = FVector::DotProduct(Run, Move.GetSafeNormal2D()); // 1 straight on, 0 at 90 deg
+			Speed = FMath::Lerp(160.f, Speed, FMath::SmoothStep(0.f, 0.9f, Along));
+		}
+	}
 	GetCharacterMovement()->MaxWalkSpeed = Speed * SpeedFactor();
 	GetCharacterMovement()->bOrientRotationToMovement = !bFaceBall;
 	if (bFaceBall)
@@ -1983,15 +2045,42 @@ void ASoccerPlayer::TickFieldAI(float Dt)
 	const FVector Me = GetActorLocation();
 	const FVector OwnGoal(-AttackSign() * HalfLength, 0.f, 0.f);
 
+	// Free training is a passing drill: the team-mate stands on his spot and faces the ball
+	if (G->IsFreeTraining())
+	{
+		GetCharacterMovement()->bOrientRotationToMovement = false;
+		FaceTowards(BallLoc, Dt);
+		return;
+	}
+
 	// Стандарт у соперника: стоим в стороне, пока мяч не введён в игру
 	if (G->MustKeepDistance(this))
 	{
 		TickRestartHold(Dt);
 		return;
 	}
+	// Our corner: into the box to attack the cross (near post, far post, penalty spot, the edge)
+	if (G->bCorner && G->GetRestartTaker() && G->GetRestartTaker()->Team == Team)
+	{
+		const FVector Spot = G->GetSetPieceSpot();
+		const float S = AttackSign(), Near = FMath::Sign(Spot.Y);
+		const FVector Runs[4] = { {S * (HalfLength - 250.f), Near * 180.f, 0.f}, {S * (HalfLength - 300.f), -Near * 220.f, 0.f},
+		                          {S * (HalfLength - 550.f), 0.f, 0.f}, {S * (HalfLength - 900.f), -Near * 150.f, 0.f} };
+		const FVector Target = Runs[RosterIndex % 4];
+		MoveTo(Target, RunSpeed);
+		if (FVector::Dist2D(Target, Me) < 150.f)
+		{
+			GetCharacterMovement()->bOrientRotationToMovement = false;
+			FaceTowards(BallLoc, Dt);
+		}
+		return;
+	}
 
-	// Мяч в воздухе рядом — играем головой: у чужих ворот — удар, иначе — скидка вперёд
-	if (CanHeadBall() && Ball->TimeSinceKick() > 0.15f)
+	// Мяч в воздухе рядом — играем головой: у чужих ворот — удар, иначе — скидка вперёд.
+	// Only a dropping ball, and not one just headed: otherwise the players headed it back and
+	// forth between the teams; the rest is let down and controlled (TryControlBall)
+	const bool bHeaderChain = GetWorld()->GetTimeSeconds() - Ball->LastHeaderTime < 1.f;
+	if (CanHeadBall() && Ball->TimeSinceKick() > 0.15f && Ball->Velocity.Z < 0.f && !bHeaderChain)
 	{
 		const FVector OppGoal(AttackSign() * HalfLength, 0.f, 0.f);
 		const bool bNearGoal = FVector::Dist2D(Me, OppGoal) < 900.f;
@@ -2261,13 +2350,20 @@ FVector ASoccerPlayer::ComputeSupportPoint() const
 	Base.X = FMath::Clamp<double>(Base.X, -HalfLength + 250.0, HalfLength - 250.0);
 	Base = ClampToField(Base, 150.f);
 
+	// The most advanced mate may also come short to show for the ball (6-7 m ahead of it, off the
+	// line of the last defender): parked on that line he was always marked and no pass reached him.
+	const bool bCanComeShort = Variant == 1 && Base.X * S >= LastLine - 150.f;
+	const float ShowSide = (Me.Y >= BallLoc.Y ? 1.f : -1.f);
+	const FVector ShortBase = ClampToField(FVector(BallLoc.X + S * 650.f, BallLoc.Y + ShowSide * 350.f, 0.f), 150.f);
+	const bool bWasRun = bRunningInBehind;
 	FVector Best = Base;
 	float BestScore = -1000.f;
-	for (int32 i = 0; i < 10; ++i)
+	for (int32 i = 0; i < (bCanComeShort ? 20 : 10); ++i)
 	{
 		const float Jitter = Variant == 0 ? 350.f : 200.f; // role spots stay near their role
-		const FVector C = i == 0 ? Base
-			: ClampToField(Base + FVector(FMath::FRandRange(-Jitter, Jitter), FMath::FRandRange(-Jitter, Jitter), 0.f), 150.f);
+		const FVector& Around = (bCanComeShort && i % 2) ? ShortBase : Base;
+		const FVector C = i <= 1 ? Around
+			: ClampToField(Around + FVector(FMath::FRandRange(-Jitter, Jitter), FMath::FRandRange(-Jitter, Jitter), 0.f), 150.f);
 		float Space = 450.f;
 		float LaneOpen = 250.f;
 		float Crowd = 0.f;
@@ -2293,6 +2389,8 @@ FVector ASoccerPlayer::ComputeSupportPoint() const
 			Best = C;
 		}
 	}
+	// a run in behind only if the high spot won, not the short one
+	if (bCanComeShort) bRunningInBehind = bWasRun && FVector::Dist2D(Best, Base) < FVector::Dist2D(Best, ShortBase);
 	return Best;
 }
 
@@ -2643,6 +2741,7 @@ void ASoccerPlayer::TickGoalkeeper(float Dt)
 	const float Side = -AttackSign();          // с какой стороны наши ворота
 	const float GoalX = Side * HalfLength;
 	GetCharacterMovement()->bOrientRotationToMovement = false;
+	if (!HasBall()) bBallAtFeet = false; // the foot-played ball has gone
 
 	if (IsPlayerControlled())
 	{
@@ -2661,7 +2760,7 @@ void ASoccerPlayer::TickGoalkeeper(float Dt)
 	{
 		FaceTowards(Me + FVector(AttackSign() * 100.f, 0.f, 0.f), Dt);
 		GKHoldTime += Dt;
-		if (GKHoldTime > 0.7f && !IsPlayingAction()) PlayDogAction(TEXT("KeeperDirect"), 0.f);
+		if (GKHoldTime > 0.7f && !IsPlayingAction() && !bBallAtFeet) PlayDogAction(TEXT("KeeperDirect"), 0.f); // hands clip, not with the ball at his feet
 		if (GKHoldTime > 1.2f)
 		{
 			KeeperDistribute();
@@ -2725,7 +2824,9 @@ void ASoccerPlayer::TickGoalkeeper(float Dt)
 	FaceTowards(BallLoc, Dt);
 
 	// Бросок: удар летит в створ, а мяч пройдёт в стороне от вратаря — прыгаем в угол
-	if (!Ball->OwnerPlayer && Ball->Velocity.X * Side > 700.f)
+	// (не на пас своего игрока: его вратарь принимает ногами, см. TryKeeperSave)
+	const bool bFromMate = Ball->LastKicker && Ball->LastKicker != this && Ball->LastKicker->Team == Team;
+	if (!Ball->OwnerPlayer && !bFromMate && Ball->Velocity.X * Side > 700.f)
 	{
 		DecideShot();
 		const float TMe = (Me.X - BallLoc.X) / Ball->Velocity.X;      // когда мяч будет на уровне вратаря
@@ -2938,13 +3039,11 @@ void ASoccerPlayer::TryKeeperSave()
 	const bool bOwnPass = Ball->LastKicker && Ball->LastKicker != this && Ball->LastKicker->Team == Team;
 	if (bOwnPass)
 	{
-		// Back-pass rule: played with the feet, straight on to a team-mate (or cleared)
+		// Back-pass rule: a team-mate's pass is played with the feet: controlled at the feet (not
+		// in the hands), then TickGoalkeeper passes it on after a look up
 		if (IsPlayerControlled()) return;
-		EPassKind Kind;
-		FVector Target;
-		float Score;
-		if (FindBestPass(Kind, Target, Score)) Pass(Kind, (Target - Me).GetSafeNormal2D(), 0.6f);
-		else Pass(EPassKind::Lob, FVector(AttackSign(), 0.f, 0.f), 0.9f);
+		bBallAtFeet = true;
+		GainBall();
 		return;
 	}
 	// Hands only inside his own penalty area; outside he clears with the feet
@@ -2979,6 +3078,7 @@ void ASoccerPlayer::KeeperCatch()
 	ASoccerGameMode* G = GM();
 	const float Height = G->Ball->GetActorLocation().Z;
 	PlayDogAction(Height < 60.f ? TEXT("CatchLow") : (Height > 150.f ? TEXT("CatchHigh") : TEXT("CatchMid")), 0.65f);
+	bBallAtFeet = false; // caught: in the hands
 	G->Ball->SetOwnerPlayer(this); // мяч в руках (см. ASoccerBall::Tick)
 	G->OnKeeperSave(this);
 	G->OnBallGained(this);
@@ -2998,7 +3098,7 @@ void ASoccerPlayer::KeeperCatch()
 // ---------------------------------------------------------------------------
 //  Удары, пасы, отборы, финты
 // ---------------------------------------------------------------------------
-ASoccerPlayer* ASoccerPlayer::FindPassTarget(const FVector& AimDir) const
+ASoccerPlayer* ASoccerPlayer::FindPassTarget(const FVector& AimDir, float MinDot, float AngleWeight) const
 {
 	// Лучший партнёр — тот, что ближе всего к направлению прицела и не слишком далеко
 	ASoccerPlayer* Best = nullptr;
@@ -3012,8 +3112,8 @@ ASoccerPlayer* ASoccerPlayer::FindPassTarget(const FVector& AimDir) const
 		if (Dist < 150.f) continue;
 		const float Dot = FVector::DotProduct(ToP / Dist, AimDir);
 		// The keeper is a target only for a pass aimed right at him (a back-pass)
-		if (Dot < (P->bGoalkeeper ? 0.8f : 0.35f)) continue;
-		const float Score = Dot * 2.f - Dist / 2500.f;
+		if (Dot < (P->bGoalkeeper ? FMath::Max(0.8f, MinDot) : MinDot)) continue;
+		const float Score = Dot * AngleWeight - Dist / 2500.f;
 		if (Score > BestScore)
 		{
 			BestScore = Score;
@@ -3048,7 +3148,10 @@ FSoccerKick ASoccerPlayer::PlanPass(EPassKind Kind, const FVector& AimDir, float
 	const FVector Aim = AimDir.IsNearlyZero() ? GetActorForwardVector() : AimDir.GetSafeNormal2D();
 	const float Power = FMath::Clamp(Power01, 0.f, 1.f);
 
-	ASoccerPlayer* Mate = FindPassTarget(Aim);
+	// Your ground pass, variant (SoccerVariants::Pass): B and C pick the mate the stick points
+	// at (cone +-40 deg, angle before distance); A is the old wide cone. AI passes stay as A.
+	const int32 PassVariant = Kind == EPassKind::Ground && IsPlayerControlled() ? SoccerVariants::Get(SoccerVariants::Pass) : 0;
+	ASoccerPlayer* Mate = PassVariant > 0 ? FindPassTarget(Aim, 0.77f, 8.f) : FindPassTarget(Aim);
 	Plan.Receiver = Mate;
 
 	FVector Target = From;
@@ -3077,9 +3180,9 @@ FSoccerKick ASoccerPlayer::PlanPass(EPassKind Kind, const FVector& AimDir, float
 	Flat.Z = 0.f;
 	const float Dist = FMath::Max(1.f, (float)Flat.Size());
 	FVector Dir = Flat / Dist;
-	if (bWithError)
+	if (bWithError && PassVariant < 2) // C: no random error
 	{
-		const float Err = KickErrorDegrees(Info.Passing, Power, Dir, !HasBall());
+		const float Err = KickErrorDegrees(Info.Passing, Power, Dir, !HasBall()) * (PassVariant == 1 ? 0.5f : 1.f);
 		Dir = Dir.RotateAngleAxis((FMath::FRand() - FMath::FRand()) * Err, FVector::UpVector);
 	}
 
@@ -3102,7 +3205,9 @@ FSoccerKick ASoccerPlayer::PlanPass(EPassKind Kind, const FVector& AimDir, float
 		// значит v0 = путь * k + скорость_прихода. Даже самый слабый пас приходит к партнёру
 		// с запасом скорости (6 м/с), сила замаха делает пас резче — до 1.4x.
 		const float Arrive = Kind == EPassKind::Through ? 750.f : 900.f; // still lively when it arrives
-		const float Speed = Mate ? (Dist * Ball->RollingFriction + Arrive) * FMath::Lerp(1.f, 1.4f, Power)
+		// Your ground pass (B/C): the bar sets how hard it arrives, 4.5 m/s on a tap to 20 m/s full
+		const float Speed = Mate && PassVariant > 0 ? Dist * Ball->RollingFriction + FMath::Lerp(450.f, 2000.f, Power)
+		                  : Mate ? (Dist * Ball->RollingFriction + Arrive) * FMath::Lerp(1.f, 1.4f, Power)
 		                         : FMath::Max(Dist * Ball->RollingFriction + 250.f, FMath::Lerp(1100.f, 2000.f, Power));
 		Plan.Velocity = Dir * FMath::Clamp(Speed, 950.f, 3000.f);
 		Plan.Spin = FVector::CrossProduct(FVector::UpVector, Plan.Velocity) / BallRadius; // катится
@@ -3168,6 +3273,8 @@ FSoccerKick ASoccerPlayer::PlanShot(const FVector& AimDir, float Power01, bool b
 		// Обычный удар с верхним вращением: мяч «ныряет»; чем сильнее — тем выше целимся
 		Speed = FMath::Lerp(1700.f, 3500.f, Power) * ShotFactor; // a whippy strike, not a lob
 		TargetZ = FMath::Lerp(40.f, 150.f, Power);
+		// Yours in the red (last 20% of the bar): it rises over the 2.2 m bar, 3 m at full power
+		if (IsPlayerControlled() && Power > 0.8f) TargetZ = FMath::Lerp(128.f, 300.f, (Power - 0.8f) / 0.2f);
 		Plan.Spin = Topspin * 15.f;
 		SpinGravity = Ball->MagnusCoeff * 15.f * Speed;
 	}
@@ -3212,8 +3319,10 @@ void ASoccerPlayer::ExecuteKick(const FSoccerKick& Plan)
 		SetActorRotation(FRotator(0.f, KickDir.Rotation().Yaw, 0.f));
 	Ball->Kick(this, Plan.Velocity, Plan.Spin);
 	Ball->IntendedReceiver = Plan.Receiver; // ИИ-партнёр побежит принимать
-	// FIFA: control moves to the receiver as the pass leaves the foot
-	if (IsPlayerControlled() && Plan.Receiver && Plan.Receiver->Team == Team && !Plan.Receiver->bGoalkeeper && !bGoalkeeper)
+	// FIFA: control moves to the receiver as the pass leaves the foot. The same for your keeper's
+	// distribution: the receiver meets it (your stick was still held on someone else and he stood).
+	const bool bYourKeeper = bGoalkeeper && Team == HumanTeam;
+	if ((IsPlayerControlled() && !bGoalkeeper || bYourKeeper) && Plan.Receiver && Plan.Receiver->Team == Team && !Plan.Receiver->bGoalkeeper)
 	{
 		if (ASoccerPlayerController* PC = HumanPC())
 		{
@@ -3299,6 +3408,7 @@ void ASoccerPlayer::Header(bool bShot, const FVector& AimDir)
 
 	Plan.Velocity = Dir * Speed + FVector(0.f, 0.f, bShot ? -150.f : 150.f);
 	ExecuteKick(Plan);
+	Ball->LastHeaderTime = GetWorld()->GetTimeSeconds();
 	PlayDogAction(TEXT("Header"), 0.55f);
 	if (bShot) GM()->OnShot(this);
 	else       GM()->OnPassMade(this);
@@ -3731,7 +3841,7 @@ void ASoccerPlayerController::PlayerTick(float DeltaTime)
 	}
 	// Мяч потеряли во время замаха — удар/пас отменяется
 	const ASoccerPlayer* P = Current();
-	if (Charging != ECharge::None && (!P || !P->HasBall()))
+	if (Charging != ECharge::None && (!P || (!P->HasBall() && !P->IsLooseBallNear())))
 	{
 		Charging = ECharge::None;
 	}
@@ -3785,8 +3895,8 @@ FVector ASoccerPlayerController::AimDirection() const
 float ASoccerPlayerController::GetCharge() const
 {
 	if (Charging == ECharge::None) return -1.f;
-	// Полная сила — за 1 секунду удержания
-	return FMath::Clamp<float>(GetWorld()->GetTimeSeconds() - ChargeStart, 0.f, 1.f);
+	// Полная сила — за 0.6 секунды удержания (было 1 с: шкала набиралась слишком медленно)
+	return FMath::Clamp<float>((GetWorld()->GetTimeSeconds() - ChargeStart) / 0.6f, 0.f, 1.f);
 }
 
 void ASoccerPlayerController::BeginCharge(ECharge Kind)
@@ -3804,7 +3914,7 @@ void ASoccerPlayerController::ReleaseCharge(ECharge Kind)
 
 	// Мяч наш, но между касаниями откатился — игрок добежит и ударит (см. ASoccerPlayer::QueueKick)
 	ASoccerPlayer* P = Current();
-	if (P && !P->HasBall() && !P->CanKickBall() && P->IsBallComingToMe() && !P->bGoalkeeper)
+	if (P && !P->HasBall() && !P->CanKickBall() && P->IsLooseBallNear() && !P->bGoalkeeper)
 	{
 		P->QueueFirstTime(Kind, AimDirection(), Kind == ECharge::Shot ? FMath::Max(0.15f, Power) : Power, bRBHeld, bLBHeld);
 		return;
@@ -4015,7 +4125,7 @@ void ASoccerPlayerController::OnA()
 	if (P->HasBall())          BeginCharge(ECharge::Pass);
 	else if (P->CanHeadBall()) P->Header(false, AimDirection());
 	else if (P->CanKickBall()) P->Pass(EPassKind::Ground, AimDirection(), 0.5f);
-	else if (P->IsBallComingToMe()) BeginCharge(ECharge::Pass); // pass first time
+	else if (P->IsLooseBallNear()) BeginCharge(ECharge::Pass); // pass first time / onto the knocked ball
 	else if (!GM() || !GM()->IsFreeTraining()) bContainHeld = true; // no opponent to contain in training
 }
 void ASoccerPlayerController::OnAStop()
@@ -4032,7 +4142,7 @@ void ASoccerPlayerController::OnB()
 	if (P->HasBall())          BeginCharge(ECharge::Shot);
 	else if (P->CanHeadBall()) P->Header(true, AimDirection());
 	else if (P->CanKickBall()) P->Shoot(AimDirection(), 0.8f, bRBHeld, bLBHeld);
-	else if (P->IsBallComingToMe()) BeginCharge(ECharge::Shot); // shoot first time
+	else if (P->IsLooseBallNear()) BeginCharge(ECharge::Shot); // shoot first time / onto the knocked ball
 	else                       P->Tackle();
 }
 void ASoccerPlayerController::OnBStop() { ReleaseCharge(ECharge::Shot); }
@@ -4080,9 +4190,9 @@ void ASoccerPlayerController::OnLBStop() { bLBHeld = false; }
 // --- Крестовина: вверх/вниз — действие, влево/вправо — вариант A/B/C ---
 void ASoccerPlayerController::OnVariantAction(int32 Step)
 {
-	// The first press only shows the picker; the next ones move through the actions.
-	if (GetWorld()->GetTimeSeconds() < VariantShowUntil)
-		VariantAction = (VariantAction + Step + SoccerVariants::NumEntries()) % SoccerVariants::NumEntries();
+	// Only the ground pass is being tuned now; the other variants and camera numbers keep
+	// their saved values (mf.Var.* / mf.Cam.* still set them from the console).
+	VariantAction = SoccerVariants::Pass;
 	VariantShowUntil = GetWorld()->GetTimeSeconds() + 3.f;
 }
 
@@ -4240,7 +4350,7 @@ void ASoccerHUD::DrawVariantPicker(const ASoccerPlayerController* PC)
 	const float K = Canvas->ClipY / 1080.f;
 	const float S = 1.3f * K;
 	const TCHAR* Letters[3] = {TEXT("A"), TEXT("B"), TEXT("C")};
-	FString Title = FString::Printf(TEXT("%s   %d/%d"), Action.Title, PC->VariantAction + 1, SoccerVariants::NumEntries());
+	FString Title = Action.Title;
 	float W = 0.f, H = 0.f, TW = 0.f, TH = 0.f;
 	GetTextSize(Title, TW, TH, Font, S);
 	const float LetterGap = 34.f * K;
@@ -4316,11 +4426,12 @@ void ASoccerHUD::DrawPlayerTag(const ASoccerPlayer* P, const FLinearColor& Color
 	const float SegW = (BarW - (Segments - 1) * Gap) / Segments;
 	const float BX = Head.X - BarW * 0.5f, BY = Y - 0.1f * PH - BarH;
 	DrawRect(FLinearColor(0.02f, 0.03f, 0.02f, 0.85f), BX - Gap, BY - Gap, BarW + 2.f * Gap, BarH + 2.f * Gap);
-	const FLinearColor Green(0.3f, 1.f, 0.05f), Yellow(1.f, 0.85f, 0.f), Orange(1.f, 0.42f, 0.f);
+	const FLinearColor Green(0.3f, 1.f, 0.05f), Yellow(1.f, 0.85f, 0.f), Orange(1.f, 0.42f, 0.f), Red(1.f, 0.05f, 0.02f);
 	for (int32 i = 0; i < Segments; ++i)
 	{
-		const float U = (i + 0.5f) / Segments;
-		const FLinearColor Lit = U < 0.5f ? FMath::Lerp(Green, Yellow, U * 2.f) : FMath::Lerp(Yellow, Orange, (U - 0.5f) * 2.f);
+		// green -> yellow -> orange -> red: the last segment is full power (a shot goes over)
+		const float U = float(i) / (Segments - 1) * 3.f;
+		const FLinearColor Lit = U < 1.f ? FMath::Lerp(Green, Yellow, U) : (U < 2.f ? FMath::Lerp(Yellow, Orange, U - 1.f) : FMath::Lerp(Orange, Red, U - 2.f));
 		DrawRect(Charge * Segments > i ? Lit : FLinearColor(0.12f, 0.13f, 0.12f, 0.9f), BX + i * (SegW + Gap), BY, SegW, BarH);
 	}
 }
@@ -4671,6 +4782,7 @@ void ASoccerGameMode::ReturnToMenu()
 	}
 	HideWidget(PauseWidget);
 	HideWidget(HudWidget);
+	SetNight(false);
 	for (AActor* Actor : TrainingRoomActors)
 	{
 		if (Actor) Actor->Destroy();
@@ -4973,10 +5085,10 @@ void ASoccerGameMode::SpawnTeams()
 	// Индекс 0 — вратарь, 1–2 — защитники, 3–4 — нападающие.
 	const FVector2D Layout[5] = {
 		FVector2D(-HalfLength + 70.f, 0.f),
-		FVector2D(-1150.f, -450.f),
-		FVector2D(-1150.f,  450.f),
-		FVector2D(-450.f,  -350.f),
-		FVector2D(-450.f,   350.f),
+		FVector2D(-1380.f, -540.f), // x1.2 with the 48 x 32 m pitch
+		FVector2D(-1380.f,  540.f),
+		FVector2D(-540.f,  -420.f),
+		FVector2D(-540.f,   420.f),
 	};
 	const float SpawnZ = 92.f; // полувысота капсулы + зазор
 
@@ -5007,6 +5119,9 @@ void ASoccerGameMode::SpawnTrainingRoom()
 	// Same court, size and physics as a match (SpawnMatchCourt also brings the surroundings)
 	SpawnMatchCourt();
 	SpawnPlayer(HumanTeam, Starter, Save->Squad[Starter], FVector(-120.f, 0.f, 92.f), 0.f);
+	// A team-mate to pass to: AI, gets open ahead of the ball; the pass hands you control of him
+	const int32 Mate = Starter == 3 ? 4 : 3;
+	SpawnPlayer(HumanTeam, Mate, Save->Squad[Mate], FVector(300.f, 500.f, 92.f), 0.f);
 	// A keeper to beat in the far goal
 	if (AwaySquad.Num() > 0)
 	{
@@ -5127,11 +5242,276 @@ void ASoccerGameMode::SpawnEnvironment(float Sx, float Sy)
 	}
 }
 
+// Night in the zoo arena. Physical-ish units: floodlights light the pitch to ~10 lux, warm lights
+// on the stands, and the exposure is fixed (auto exposure would lift the night back to day).
+static TAutoConsoleVariable<float> CVarNightEV(TEXT("mf.Night.EV"), 3.f, TEXT("Night exposure (EV100, fixed); lower = brighter. Applied on the next match/training start"));
+static TAutoConsoleVariable<float> CVarNightFlood(TEXT("mf.Night.Flood"), 60000.f, TEXT("Night: floodlight intensity per mast (cd)"));
+static TAutoConsoleVariable<float> CVarNightWarm(TEXT("mf.Night.Warm"), 120.f, TEXT("Night: warm lights on the stands (cd)"));
+static TAutoConsoleVariable<float> CVarNightMoon(TEXT("mf.Night.Moon"), 45.f, TEXT("Night: the level's sun becomes the even wash over the pitch (lux)"));
+
+void ASoccerGameMode::SetNight(bool bNight)
+{
+	// back to day: the level's lights get their intensities back (night actors die with TrainingRoomActors)
+	for (const TPair<TWeakObjectPtr<ULightComponentBase>, float>& Saved : DayLights)
+	{
+		if (ULightComponent* L = Cast<ULightComponent>(Saved.Key.Get())) L->SetIntensity(Saved.Value);
+		else if (USkyLightComponent* S = Cast<USkyLightComponent>(Saved.Key.Get())) S->SetIntensity(Saved.Value);
+	}
+	DayLights.Reset();
+	if (!bNight) return;
+
+	for (TActorIterator<ADirectionalLight> It(GetWorld()); It; ++It)
+	{
+		ULightComponent* L = It->GetLightComponent();
+		DayLights.Emplace(L, L->Intensity);
+		L->SetIntensity(CVarNightMoon.GetValueOnGameThread());
+		L->SetLightColor(FLinearColor(0.9f, 0.93f, 1.f)); // floodlight white (the day colour is not restored: it was white too)
+	}
+	for (TActorIterator<ASkyLight> It(GetWorld()); It; ++It)
+	{
+		USkyLightComponent* S = It->GetLightComponent();
+		DayLights.Emplace(S, S->Intensity);
+		S->SetIntensity(0.15f);
+	}
+	if (APostProcessVolume* PP = GetWorld()->SpawnActor<APostProcessVolume>())
+	{
+		PP->bUnbound = true;
+		PP->Priority = 100.f;
+		FPostProcessSettings& S = PP->Settings;
+		S.bOverride_AutoExposureMinBrightness = S.bOverride_AutoExposureMaxBrightness = true;
+		S.AutoExposureMinBrightness = S.AutoExposureMaxBrightness = CVarNightEV.GetValueOnGameThread();
+		S.bOverride_BloomIntensity = true;
+		S.BloomIntensity = 1.2f;
+		TrainingRoomActors.Add(PP);
+	}
+	auto Point = [this](const FVector& At, const FLinearColor& Color, float Candela, float Radius)
+	{
+		APointLight* A = GetWorld()->SpawnActor<APointLight>(At, FRotator::ZeroRotator);
+		if (!A) return;
+		UPointLightComponent* L = Cast<UPointLightComponent>(A->GetLightComponent());
+		L->SetMobility(EComponentMobility::Movable);
+		L->SetIntensityUnits(ELightUnits::Candelas);
+		L->SetIntensity(Candela);
+		L->SetLightColor(Color);
+		L->SetAttenuationRadius(Radius);
+		L->SetCastShadows(false);
+		TrainingRoomActors.Add(A);
+	};
+	// floodlights on the masts (arena layout, SourceArt/Environment/Zoo), aimed across the pitch
+	const float Flood = CVarNightFlood.GetValueOnGameThread();
+	const FVector Masts[6] = { {-1500.f, -3200.f, 2100.f}, {1500.f, -3200.f, 2100.f}, {-3850.f, -900.f, 1900.f},
+	                           {-3850.f, 900.f, 1900.f}, {3850.f, -900.f, 1900.f}, {3850.f, 900.f, 1900.f} };
+	auto Spot = [this](const FVector& At, const FVector& Dir, float Candela, float Outer, bool bShadows)
+	{
+		// movable from the start: a stationary light spawned at runtime has no shadow channel and stays dark
+		AActor* A = GetWorld()->SpawnActor<AActor>(At, Dir.Rotation());
+		if (!A) return;
+		USpotLightComponent* L = NewObject<USpotLightComponent>(A);
+		L->SetMobility(EComponentMobility::Movable);
+		A->SetRootComponent(L);
+		L->RegisterComponent();
+		L->SetIntensityUnits(ELightUnits::Candelas);
+		L->SetIntensity(Candela);
+		L->SetLightColor(FLinearColor(1.f, 0.95f, 0.86f));
+		L->SetOuterConeAngle(Outer);
+		L->SetInnerConeAngle(Outer * 0.6f);
+		L->SetAttenuationRadius(9000.f);
+		L->SetCastShadows(bShadows);
+		TrainingRoomActors.Add(A);
+	};
+	for (int32 i = 0; i < 6; ++i)
+	{
+		// narrow beams from the mast heads (3 m out in front: the head's geometry would shadow them),
+		// aimed at the pitch, so the stands under them are not blown out
+		const FVector Aim(Masts[i].X * 0.15f, Masts[i].Y * 0.15f, 0.f);
+		const FVector Dir = (Aim - Masts[i]).GetSafeNormal();
+		Spot(Masts[i] + Dir * 300.f, Dir, Flood * 0.35f, 28.f, i < 2); // two shadow casters: players get a shadow
+	}
+	// warm glow on the stands, the gate and blue light off the waterfalls
+	const float Warm = CVarNightWarm.GetValueOnGameThread();
+	const FLinearColor Amber(1.f, 0.62f, 0.3f);
+	for (float X = -2000.f; X <= 2000.f; X += 800.f) Point(FVector(X, -2400.f, 350.f), Amber, Warm, 1400.f);
+	for (float Sx : {-1.f, 1.f})
+		for (float Y = -1200.f; Y <= 1200.f; Y += 800.f) Point(FVector(Sx * 3150.f, Y, 350.f), Amber, Warm, 1400.f);
+	Point(FVector(0.f, -2000.f, 700.f), Amber, Warm * 4.f, 1800.f);
+	for (float Sx : {-1.f, 1.f}) Point(FVector(Sx * 2700.f, -2000.f, 300.f), FLinearColor(0.3f, 0.7f, 1.f), Warm * 2.f, 1500.f);
+}
+
+// Zoo arena props from the packs and Meshy (SourceArt/Environment/Zoo/Meshy, Scripts/meshy_generate.py).
+// Positions are in pitch space (cm): the far side is -Y, the ends are +-X.
+static TAutoConsoleVariable<float> CVarZooPropYaw(TEXT("mf.Zoo.PropYaw"), 0.f, TEXT("Yaw added to the Meshy props (their authored facing); applied on the next start"));
+
+static UStaticMesh* ZooMesh(const FString& Folder)
+{
+	// Scripts/import_zoo_arena.py puts <Folder>/<Name>.glb at <Folder>/<Name>/StaticMeshes/<Name>;
+	// the asset registry is only a fallback (in -game it is not scanned yet when a match starts)
+	const FString Name = FPaths::GetCleanFilename(Folder);
+	if (UStaticMesh* M = LoadObject<UStaticMesh>(nullptr, *FString::Printf(TEXT("%s/%s/StaticMeshes/%s.%s"), *Folder, *Name, *Name, *Name), nullptr, LOAD_NoWarn | LOAD_Quiet))
+		return M;
+	TArray<FAssetData> Found;
+	FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get().GetAssetsByPath(FName(*Folder), Found, true);
+	for (const FAssetData& A : Found)
+		if (A.AssetClassPath == UStaticMesh::StaticClass()->GetClassPathName()) return Cast<UStaticMesh>(A.GetAsset());
+	return nullptr;
+}
+
+static void SpawnZooProps(UWorld* World, TArray<TObjectPtr<AActor>>& Out)
+{
+	const float PropYaw = CVarZooPropYaw.GetValueOnGameThread();
+	auto Meshy = [](const TCHAR* Name) { return ZooMesh(FString::Printf(TEXT("/Game/Environment/Zoo/Meshy/%s"), Name)); };
+	auto Rock = [](const TCHAR* Name) { return LoadObject<UStaticMesh>(nullptr, *FString::Printf(TEXT("/Game/LP_RocksandCliffs/Meshes/%s.%s"), Name, Name), nullptr, LOAD_NoWarn | LOAD_Quiet); };
+	// uniform scale that makes the mesh Height tall, and the lift that puts its bottom on Z
+	auto Fit = [](const UStaticMesh* M, float Height, float& OutScale, float& OutLift)
+	{
+		const FBox B = M->GetBoundingBox();
+		OutScale = Height / FMath::Max(1.f, float(B.GetSize().Z));
+		OutLift = -float(B.Min.Z) * OutScale;
+	};
+	auto Place = [&](UStaticMesh* M, const FVector& At, float Yaw, float Scale, bool bQuery) -> AStaticMeshActor*
+	{
+		if (!M) return nullptr;
+		AStaticMeshActor* A = World->SpawnActor<AStaticMeshActor>(At, FRotator(0.f, Yaw, 0.f));
+		if (!A) return nullptr;
+		A->SetMobility(EComponentMobility::Movable);
+		UStaticMeshComponent* C = A->GetStaticMeshComponent();
+		C->SetStaticMesh(M);
+		C->SetCollisionEnabled(bQuery ? ECollisionEnabled::QueryOnly : ECollisionEnabled::NoCollision);
+		C->SetCollisionResponseToAllChannels(ECR_Ignore);
+		C->SetCollisionResponseToChannel(ECC_Visibility, bQuery ? ECR_Block : ECR_Ignore);
+		A->SetActorScale3D(FVector(Scale));
+		Out.Add(A);
+		return A;
+	};
+	auto Statue = [&](const TCHAR* Name, const FVector& At, float Yaw, float Height)
+	{
+		UStaticMesh* M = Meshy(Name);
+		if (!M) return;
+		float S, Lift; Fit(M, Height, S, Lift);
+		// stand it on whatever is below (a cliff top), found with a trace against the rocks
+		FHitResult Hit; FVector Ground = At;
+		if (World->LineTraceSingleByChannel(Hit, At + FVector(0.f, 0.f, 3000.f), At - FVector(0.f, 0.f, 500.f), ECC_Visibility)) Ground = Hit.ImpactPoint;
+		Place(M, Ground + FVector(0.f, 0.f, Lift), Yaw + PropYaw, S, false);
+	};
+	auto Instanced = [&](UStaticMesh* M) -> UHierarchicalInstancedStaticMeshComponent*
+	{
+		if (!M) return nullptr;
+		AActor* A = World->SpawnActor<AActor>();
+		USceneComponent* Root = NewObject<USceneComponent>(A, TEXT("Root"));
+		A->SetRootComponent(Root); Root->RegisterComponent();
+		UHierarchicalInstancedStaticMeshComponent* H = NewObject<UHierarchicalInstancedStaticMeshComponent>(A);
+		H->SetStaticMesh(M);
+		H->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		H->SetupAttachment(Root); H->RegisterComponent();
+		Out.Add(A);
+		return H;
+	};
+
+	// far corners: cliffs (they take the traces), the near corners: low rocks
+	struct FRockSpot { const TCHAR* Name; FVector At; float Yaw; float Scale; };
+	const FRockSpot Rocks[] = {
+		{TEXT("SM_Rock_Large_01"), {-3150.f, -2600.f, 0.f}, 30.f, 0.8f}, {TEXT("sm_cliff_13"), {-2650.f, -2250.f, 0.f}, 200.f, 0.55f},
+		{TEXT("SM_Cliff_02"), {-3500.f, -1750.f, 0.f}, 110.f, 0.45f},   {TEXT("sm_rock_large_05"), {-2450.f, -2900.f, 0.f}, 0.f, 0.7f},
+		{TEXT("sm_rock_large_03"), {3150.f, -2600.f, 0.f}, 160.f, 0.8f}, {TEXT("SM_Cliff_04"), {2650.f, -2250.f, 0.f}, 20.f, 0.5f},
+		{TEXT("sm_cliff_14"), {3500.f, -1750.f, 0.f}, 250.f, 0.45f},     {TEXT("sm_rock_large_16"), {2450.f, -2900.f, 0.f}, 90.f, 0.9f},
+		{TEXT("sm_cliff_15"), {-3300.f, 2200.f, 0.f}, 60.f, 0.35f},     {TEXT("sm_cliff_16"), {3300.f, 2200.f, 0.f}, 300.f, 0.35f},
+	};
+	for (const FRockSpot& R : Rocks) Place(Rock(R.Name), R.At, R.Yaw, R.Scale, true);
+
+	// statues: lion on the left cliff (screen left is -X from the match camera), giraffe on the right
+	Statue(TEXT("LionStatue"), FVector(-3150.f, -2550.f, 0.f), 60.f, 380.f);
+	Statue(TEXT("GiraffeStatue"), FVector(3150.f, -2550.f, 0.f), 120.f, 700.f);
+	Statue(TEXT("PolarBear"), FVector(-2500.f, -1650.f, 0.f), 40.f, 190.f);
+	Statue(TEXT("Elephant"), FVector(3300.f, -1250.f, 0.f), 200.f, 330.f);
+	for (int32 i = 0; i < 5; ++i)
+		Statue(TEXT("Flamingo"), FVector(2750.f + (i % 3) * 110.f, -1500.f + (i / 3) * 120.f, 15.f), 150.f + i * 35.f, 150.f);
+
+	// floodlight masts where the spot lights hang (SetNight), 20 m
+	if (UStaticMesh* M = Meshy(TEXT("Floodlight")))
+	{
+		float S, Lift; Fit(M, 2150.f, S, Lift);
+		const FVector Masts[6] = { {-1500.f, -3250.f, 0.f}, {1500.f, -3250.f, 0.f}, {-3900.f, -900.f, 0.f}, {-3900.f, 900.f, 0.f}, {3900.f, -900.f, 0.f}, {3900.f, 900.f, 0.f} };
+		for (const FVector& At : Masts)
+			if (AStaticMeshActor* Mast = Place(M, At + FVector(0.f, 0.f, Lift), (FVector(0.f, 0.f, 0.f) - At).Rotation().Yaw + PropYaw, S, false))
+				Mast->GetStaticMeshComponent()->SetCastShadow(false); // the spot lights hang in its lamp head
+	}
+
+	FRandomStream Rand(1234);
+	// palms: behind the far stands, round the cliffs, beyond the ends and behind the near side
+	TArray<UHierarchicalInstancedStaticMeshComponent*> Palms;
+	for (const TCHAR* Name : {TEXT("Palm"), TEXT("Palm_2"), TEXT("Palm_3")})
+		if (UHierarchicalInstancedStaticMeshComponent* P = Instanced(Meshy(Name))) Palms.Add(P);
+	TArray<UHierarchicalInstancedStaticMeshComponent*> Bushes;
+	for (const TCHAR* Name : {TEXT("Bush"), TEXT("Bush_2"), TEXT("Bush_3")})
+		if (UHierarchicalInstancedStaticMeshComponent* B = Instanced(Meshy(Name))) Bushes.Add(B);
+	if (Palms.Num() > 0)
+	{
+		TArray<FVector> Spots;
+		for (float X = -2400.f; X <= 2400.f; X += 450.f) Spots.Add(FVector(X + Rand.FRandRange(-120.f, 120.f), -3400.f + Rand.FRandRange(-150.f, 150.f), 0.f));
+		for (float Sx : {-1.f, 1.f})
+		{
+			for (float Y = -1600.f; Y <= 1600.f; Y += 500.f) Spots.Add(FVector(Sx * 4050.f + Rand.FRandRange(-100.f, 100.f), Y, 0.f));
+			for (int32 i = 0; i < 5; ++i) Spots.Add(FVector(Sx * Rand.FRandRange(2300.f, 3900.f), Rand.FRandRange(-3500.f, -3000.f), 0.f));
+		}
+		for (float X = -3600.f; X <= 3600.f; X += 600.f) Spots.Add(FVector(X, 3700.f + Rand.FRandRange(-100.f, 100.f), 0.f));
+		for (const FVector& P : Spots)
+		{
+			UHierarchicalInstancedStaticMeshComponent* H = Palms[Rand.RandRange(0, Palms.Num() - 1)];
+			float S, Lift; Fit(H->GetStaticMesh(), 900.f, S, Lift);
+			const float K = S * Rand.FRandRange(0.85f, 1.2f);
+			H->AddInstance(FTransform(FRotator(0.f, Rand.FRandRange(0.f, 360.f), 0.f), P + FVector(0.f, 0.f, -float(H->GetStaticMesh()->GetBoundingBox().Min.Z) * K), FVector(K)), true);
+			// tropical undergrowth round the foot of every palm
+			for (int32 b = 0; b < 2 && Bushes.Num() > 0; ++b)
+			{
+				UHierarchicalInstancedStaticMeshComponent* B = Bushes[Rand.RandRange(0, Bushes.Num() - 1)];
+				float BS, BL; Fit(B->GetStaticMesh(), Rand.FRandRange(120.f, 220.f), BS, BL);
+				const FVector At = P + FVector(Rand.FRandRange(-200.f, 200.f), Rand.FRandRange(-200.f, 200.f), BL);
+				B->AddInstance(FTransform(FRotator(0.f, Rand.FRandRange(0.f, 360.f), 0.f), At, FVector(BS)), true);
+			}
+		}
+	}
+	// lanterns round the pools and the gate
+	if (UStaticMesh* M = Meshy(TEXT("Lantern")))
+	{
+		float S, Lift; Fit(M, 280.f, S, Lift);
+		const FVector Spots[] = { {-600.f, -2050.f, 0.f}, {600.f, -2050.f, 0.f}, {-2250.f, -1450.f, 0.f}, {2250.f, -1450.f, 0.f}, {-2900.f, -1300.f, 0.f}, {2900.f, -1300.f, 0.f} };
+		for (const FVector& P : Spots) Place(M, P + FVector(0.f, 0.f, Lift), PropYaw, S, false);
+	}
+
+	// the crowd: tigers, pandas and wolves on every tier row of the stands (SM_Zoo_Stands layout:
+	// rows 85 cm deep, 45 cm rise from 1.3 m; the far side has the gate gap at |x| < 4.5 m)
+	// every species and variant that was generated (Scripts/meshy_generate.py): a mixed crowd
+	TArray<UHierarchicalInstancedStaticMeshComponent*> Fans;
+	TArray<float> FanScale, FanLift;
+	for (const TCHAR* Kind : {TEXT("Tiger"), TEXT("Panda"), TEXT("Wolf"), TEXT("Lion"), TEXT("Elephant"), TEXT("Giraffe"), TEXT("Monkey"), TEXT("Fox"), TEXT("Bear")})
+		for (const TCHAR* Var : {TEXT(""), TEXT("_2"), TEXT("_3")})
+			if (UHierarchicalInstancedStaticMeshComponent* H = Instanced(Meshy(*FString::Printf(TEXT("Fan%s%s"), Kind, Var))))
+			{
+				float Sc, Li; Fit(H->GetStaticMesh(), 115.f, Sc, Li);
+				Fans.Add(H); FanScale.Add(Sc); FanLift.Add(Li);
+			}
+	auto Seat = [&](const FVector& P, float Yaw)
+	{
+		if (Rand.FRand() < 0.12f || Fans.Num() == 0) return; // an empty seat here and there
+		const int32 K = Rand.RandRange(0, Fans.Num() - 1);
+		const float Sc = FanScale[K] * Rand.FRandRange(0.9f, 1.1f);
+		// Meshy's figures face their local -Y: -90 turns them to the pitch
+		Fans[K]->AddInstance(FTransform(FRotator(0.f, Yaw - 90.f + PropYaw + Rand.FRandRange(-15.f, 15.f), 0.f), P + FVector(0.f, 0.f, FanLift[K] * Sc / FanScale[K]), FVector(Sc)), true);
+	};
+	for (int32 Row = 0; Row < 10; ++Row)
+		for (float X = -2150.f; X <= 2150.f; X += 75.f)
+			if (FMath::Abs(X) > 470.f) Seat(FVector(X + Rand.FRandRange(-8.f, 8.f), -(2038.f + Row * 85.f + 45.f), 130.f + Row * 45.f), 90.f);
+	for (float Sx : {-1.f, 1.f})
+		for (int32 Row = 0; Row < 8; ++Row)
+			for (float Y = -1350.f; Y <= 1350.f; Y += 75.f)
+				Seat(FVector(Sx * (2838.f + Row * 85.f + 45.f), Y + Rand.FRandRange(-8.f, 8.f), 130.f + Row * 45.f), Sx > 0.f ? 180.f : 0.f);
+}
+
 // The match is played in the training court too: the model is stretched to the match
 // pitch, its own goals are hidden (they would stretch) and real-size copies stand in.
 // The generated field keeps its invisible floor, boards and goal triggers for gameplay.
 void ASoccerGameMode::SpawnMatchCourt()
 {
+	SetNight(false);
 	for (AActor* Actor : TrainingRoomActors)
 	{
 		if (Actor) Actor->Destroy();
@@ -5201,6 +5581,32 @@ void ASoccerGameMode::SpawnMatchCourt()
 	for (int32 Side : {-1, 1})
 	{
 		SpawnMesh(GoalMesh, FVector(Side * HalfLength, 0.f, 0.f), Side > 0 ? 0.f : 180.f, GoalScale);
+	}
+	// Night-zoo arena (SourceArt/Environment/Zoo, Scripts/import_zoo_arena.py): boards on the
+	// ball's walls (+3 m), stands, animal crowd, the ZOO gate and decor, authored in pitch space.
+	// The glTF import flips Y, so it is turned round to put the gate on the far side (-Y).
+	TArray<UStaticMesh*> Zoo;
+	// Blender parts; the crowd, rocks, statues, palms and masts come from the packs and Meshy (SpawnZooProps)
+	for (const TCHAR* Part : {TEXT("Boards"), TEXT("Stands"), TEXT("Gate"), TEXT("Water"), TEXT("Skyline")})
+	{
+		if (UStaticMesh* M = ZooMesh(FString::Printf(TEXT("/Game/Environment/Zoo/SM_Zoo_%s"), Part)))
+			Zoo.Add(M);
+	}
+	if (Zoo.Num() >= 3)
+	{
+		for (UStaticMesh* M : Zoo) SpawnMesh(M, FVector::ZeroVector, 180.f, FVector::OneVector);
+		SpawnZooProps(GetWorld(), TrainingRoomActors);
+		// the old court's own stands, fence and lights give way to the arena; its grass stays
+		if (AStaticMeshActor* Court = TrainingRoomActors.Num() > 0 ? Cast<AStaticMeshActor>(TrainingRoomActors[0]) : nullptr)
+		{
+			UStaticMeshComponent* C = Court->GetStaticMeshComponent();
+			for (int32 Slot = 2; Slot < C->GetNumMaterials(); ++Slot) C->SetMaterial(Slot, Hidden);
+		}
+		// dark plaza under the whole arena (the court floor ends short of the stands)
+		if (AStaticMeshActor* Ground = SpawnMesh(CubeMesh, FVector(0.f, 0.f, -8.f), 0.f, FVector(120.f, 100.f, 0.1f)))
+			Paint(Ground->GetStaticMeshComponent(), FLinearColor(0.035f, 0.035f, 0.045f));
+		SetNight(true);
+		return;
 	}
 	SpawnEnvironment(HalfLength / 1048.f, HalfWidth / 610.f);
 }
@@ -5671,8 +6077,12 @@ void ASoccerGameMode::StartSetPiece()
 		}
 	}
 
-	// Исполнитель — пострадавший: у мяча, лицом к воротам соперника
-	Place(Taker, SetPieceSpot - ToGoal * 70.f, GoalCenter);
+	// Исполнитель — пострадавший: у мяча, лицом к воротам соперника. On a corner he stands beside
+	// the ball, off the pitch (Goals): behind it he stood in the camera's line to the box.
+	if (bPendingCorner)
+		Place(Taker, SetPieceSpot + FVector(0.f, FMath::Sign(SetPieceSpot.Y) * 75.f, 0.f) - ToGoal * 35.f, GoalCenter);
+	else
+		Place(Taker, SetPieceSpot - ToGoal * 70.f, GoalCenter);
 	Taker->GainBall();
 	Taker->ProtectTime = 1.f; // соперник не отбирает мяч в первую секунду
 	BeginRestart(bPenalty ? ESoccerRestart::Penalty : ESoccerRestart::FreeKick, Taker, SetPieceSpot);
@@ -5680,6 +6090,8 @@ void ASoccerGameMode::StartSetPiece()
 	bPendingKickIn = false;
 	bCorner = bPendingCorner;
 	bPendingCorner = false;
+	bGoalKick = bOutOfPlayRestart && Taker->bGoalkeeper; // from the ground in his area, not from the hands
+	Taker->bBallAtFeet = bGoalKick;
 	if (bKickIn && Taker->Team == HumanTeam)
 	{
 		// FIFA-style kick-in the way the player wants it: the team-mate takes it, you are
@@ -5735,6 +6147,7 @@ void ASoccerGameMode::ResetPositions()
 		bTrainingCamValid = false; // the camera cuts to the restart instead of flying there
 		if (APlayerController* PC = GetWorld()->GetFirstPlayerController())
 			if (PC->PlayerCameraManager) PC->PlayerCameraManager->StartCameraFade(1.f, 0.f, 0.35f, FLinearColor::Black);
+		PossessHuman(); // back to the starter: the team-mate went home and must not stand on the spot
 		if (ASoccerPlayer* P = GetHumanPlayer())
 		{
 			// Every goal (and every ball out of play) restarts from the centre spot
@@ -5974,7 +6387,7 @@ void ASoccerGameMode::BeginRestart(ESoccerRestart Kind, ASoccerPlayer* Taker, co
 {
 	Restart = Kind;
 	RestartTaker = Taker;
-	bKickIn = bCorner = false; // StartSetPiece marks kick-ins and corners after this
+	bKickIn = bCorner = bGoalKick = false; // StartSetPiece marks kick-ins, corners and goal kicks after this
 	SetPieceSpot = Spot;
 	RestartStartTime = GetWorld()->GetTimeSeconds();
 	if (Taker)
@@ -6235,7 +6648,10 @@ void ASoccerGameMode::Tick(float DeltaSeconds)
 			const ASoccerPlayer* Taker = RestartTaker.Get();
 			const bool bKicked = Ball->GetLastKickTime() > RestartStartTime;
 			const bool bMoved = FVector::Dist2D(Ball->GetActorLocation(), SetPieceSpot) > 150.f;
-			if (!Taker || !Taker->HasBall() || bKicked || bMoved || GetWorld()->GetTimeSeconds() - RestartStartTime > 8.f)
+			// The 8 s give-up only unsticks an AI taker: yours waits as long as you like (it ran out on
+			// a waiting kick-off and the team-mates ran into the opponents' half before the ball was played)
+			const bool bGiveUp = Taker && !Taker->IsPlayerControlled() && GetWorld()->GetTimeSeconds() - RestartStartTime > 8.f;
+			if (!IsIntro() && (!Taker || !Taker->HasBall() || bKicked || bMoved || bGiveUp))
 			{
 				Restart = ESoccerRestart::None;
 				RestartTaker.Reset();
@@ -6397,10 +6813,13 @@ void ASoccerGameMode::UpdateCamera(float Dt)
 		const FVector Box(FMath::Sign(SetPieceSpot.X) * (HalfLength - 450.f), 0.f, 0.f);
 		const FVector D = (Box - SetPieceSpot).GetSafeNormal2D();
 		const FVector Side = FVector::CrossProduct(FVector::UpVector, D);
-		const FVector Eye = SetPieceSpot - D * 800.f + Side * 300.f + FVector(0.f, 0.f, 380.f); // the taker ends up at the left edge
-		const FRotator Look = (SetPieceSpot + D * 1300.f - Eye).Rotation();
+		// Low and close behind the ball, the box in the middle of the frame and the ball low in it
+		// (measured on a Goals corner): from 8 m back and 3.8 m up the box was a speck far away.
+		const FVector Eye = SetPieceSpot - D * 650.f + Side * 60.f + FVector(0.f, 0.f, 300.f);
+		// 15 deg down: the ball ~10 deg below the centre, the box ~8 deg above it
+		const FRotator Look(-15.f, (Box - Eye).Rotation().Yaw, 0.f);
 		MatchCamYaw = Look.Yaw;
-		Camera->GetCameraComponent()->SetFieldOfView(62.f);
+		Camera->GetCameraComponent()->SetFieldOfView(60.f);
 		Camera->SetActorLocationAndRotation(Eye, Look);
 		return;
 	}

@@ -51,7 +51,7 @@ struct FKey;
 // console variables mf.Var.<Action> (for the test harness).
 namespace SoccerVariants
 {
-	enum EAction : int32 { KickOnRun, Dribble, Receive, Keeper, Support, Defense, Tempo, Num };
+	enum EAction : int32 { KickOnRun, Dribble, Receive, Keeper, Support, Defense, Tempo, Pass, Num };
 	struct FAction { const TCHAR* Id; const TCHAR* Title; const TCHAR* Names[3]; };
 	const FAction& Describe(int32 Action);
 	int32 Get(int32 Action);
@@ -66,13 +66,13 @@ namespace SoccerVariants
 	inline int32 NumEntries() { return Num + NumTunes(); }
 }
 
-// Размеры в сантиметрах (1 uu = 1 см). Поле 40×27 м, ворота 5×2.2 м.
+// Размеры в сантиметрах (1 uu = 1 см). Поле 48×32 м (было 40×27), ворота 5×2.2 м.
 // Центр поля — (0,0,0). Длинная ось поля — X, ширина — Y.
 // Команда 0 (человек) атакует в сторону +X, команда 1 — в сторону −X.
 namespace Soccer
 {
-	constexpr float HalfLength    = 2000.f; // половина длины поля
-	constexpr float HalfWidth     = 1350.f; // половина ширины поля
+	constexpr float HalfLength    = 2400.f; // половина длины поля
+	constexpr float HalfWidth     = 1600.f; // половина ширины поля
 	// 5 x 2.2 m: ~2.7 keeper heights (a 1.88 m giraffe). At 3 x 2 m the keeper covered
 	// almost the whole goal and a shot into the corner was no better than one at him.
 	constexpr float GoalHalfWidth = 250.f;  // половина ширины ворот
@@ -225,6 +225,7 @@ public:
 	// Толчок мяча по газону с заданной скоростью (владелец не меняется).
 	void Touch(const FVector& NewVelocity);
 	float TrapUntil = 0.f; // receive variant C: the ball is killed at the feet until then
+	float LastHeaderTime = -100.f; // the AI does not head a header straight back (no head tennis)
 	float LeadUntil = 0.f; // receive variant B: first touch out in front along LeadDir
 	FVector LeadDir = FVector::ZeroVector;
 
@@ -395,6 +396,8 @@ public:
 	// First-time kick: pressed while the pass is still on its way, it fires the moment the
 	// ball reaches the foot, with no reception touch.
 	bool IsBallComingToMe() const;
+	// Loose and playable soon: on its way here, or close by (just knocked ahead with the right stick)
+	bool IsLooseBallNear() const;
 	void QueueFirstTime(ECharge Kind, const FVector& AimDir, float Power01, bool bFinesse, bool bChip);
 	ECharge FirstTimeKind = ECharge::None;
 	FVector FirstTimeAim = FVector::ZeroVector;
@@ -430,6 +433,7 @@ public:
 
 	int32 Team = 0;
 	bool bGoalkeeper = false;
+	bool bBallAtFeet = false;    // keeper plays this ball with his feet (a team-mate's pass, a goal kick), not in the hands
 	int32 RosterIndex = 0;       // номер в составе (0 — вратарь)
 	FVector Home = FVector::ZeroVector;
 	float HomeYaw = 0.f;
@@ -499,7 +503,8 @@ private:
 	void StartDash(const FVector& Dir, float Speed, float Time, bool bSlide, bool bTurn = true);
 	void ExecuteKick(const FSoccerKick& Plan);
 	float SpeedFactor() const;
-	ASoccerPlayer* FindPassTarget(const FVector& AimDir) const;
+	// MinDot: the cone around the aim; AngleWeight: how much the angle outweighs the distance
+	ASoccerPlayer* FindPassTarget(const FVector& AimDir, float MinDot = 0.35f, float AngleWeight = 2.f) const;
 	ASoccerPlayer* NearestOpponent(float& OutDist) const;
 	ASoccerGameMode* GM() const;
 	ASoccerPlayerController* HumanPC() const;
@@ -760,10 +765,14 @@ public:
 	// ---------- Стандарты ----------
 	ESoccerRestart GetRestart() const { return Restart; }
 	bool IsRestartTaker(const ASoccerPlayer* P) const;
+	const ASoccerPlayer* GetRestartTaker() const { return Restart != ESoccerRestart::None ? RestartTaker.Get() : nullptr; }
+	FVector GetSetPieceSpot() const { return SetPieceSpot; }
 	// Kick-in by the human's team: the AI takes it, the human plays the one getting open.
 	bool IsKickIn() const { return bKickIn && Restart != ESoccerRestart::None; }
 	bool bKickIn = false;
 	bool bCorner = false;
+	bool bGoalKick = false; // the running restart is a goal kick: the keeper takes it with his feet
+	bool IsGoalKickBy(const ASoccerPlayer* P) const { return bGoalKick && Restart != ESoccerRestart::None && P && RestartTaker.Get() == P; }
 	bool IsFirstPersonCorner() const { return bCorner && Restart != ESoccerRestart::None && RestartTaker.IsValid() && RestartTaker->IsPlayerControlled(); }           // the running restart is a corner (first-person view for yours)
 	bool bPendingCorner = false;
 	// Kick-off not taken yet: everyone except the taker stands still
@@ -830,6 +839,10 @@ private:
 	void SpawnTrainingRoom();
 	void SpawnMatchCourt();
 	void CheckBallOut();
+	// Night for the zoo arena: dims the level's sun and sky, fixes the exposure, adds floodlights
+	// and warm lights on the stands (spawned into TrainingRoomActors). false restores the day.
+	void SetNight(bool bNight);
+	TArray<TPair<TWeakObjectPtr<class ULightComponentBase>, float>> DayLights;
 	bool bOutOfPlayRestart = false; // kick-in / corner / goal kick: no wall
 	bool bPendingKickIn = false;    // the coming set piece is a kick-in
 	float TrainingBallOutTime = -1.f; // training: the ball rolled out, put it back after a moment

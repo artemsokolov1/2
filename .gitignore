@@ -47,3 +47,14 @@ SourceArt/Environment/PolyHaven/
 SourceArt/Environment/Export/
 # Poly Haven props (Scripts/import_environment.py re-creates them)
 Content/Environment/Props/
+
+# Паки с Fab и импортированные ассеты арены — тяжёлые (Iceland 1.2 ГБ, Meshy ~0.6 ГБ),
+# облачным агентам не нужны. Арена восстанавливается скриптами:
+#   Scripts/meshy_generate.py (модели Meshy), Scripts/import_zoo_arena.py, Scripts/fix_zoo_instancing.py
+Content/Iceland_Environment/
+Content/Fab/
+Content/LP_RocksandCliffs/
+Content/Environment/Zoo/
+SourceArt/Environment/Zoo/Meshy/*.glb
+SourceArt/**/*.blend
+SourceArt/**/*.blend1
